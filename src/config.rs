@@ -54,6 +54,10 @@ pub struct Config {
     pub dropdown_position: Edge,
     pub dropdown_hide_on_focus_loss: bool,
     pub dropdown_always_on_top: bool,
+    /// Global hotkey that toggles the dropdown (empty = none).
+    pub dropdown_hotkey: String,
+    /// Start the dropdown hidden at login (XDG autostart entry).
+    pub dropdown_autostart: bool,
 }
 
 impl Default for Config {
@@ -90,6 +94,8 @@ impl Default for Config {
             // a screen reader popup or a notification) is disorienting.
             dropdown_hide_on_focus_loss: false,
             dropdown_always_on_top: true,
+            dropdown_hotkey: "F12".into(),
+            dropdown_autostart: false,
         }
     }
 }
@@ -173,6 +179,8 @@ pub const KEYS: &[&str] = &[
     "dropdown-position",
     "dropdown-hide-on-focus-loss",
     "dropdown-always-on-top",
+    "dropdown-hotkey",
+    "dropdown-autostart",
 ];
 
 pub fn tab_bar_name(t: TabBar) -> &'static str {
@@ -282,6 +290,13 @@ impl Config {
             }
             "dropdown-hide-on-focus-loss" => self.dropdown_hide_on_focus_loss = parse_bool(v).ok_or_else(bad)?,
             "dropdown-always-on-top" => self.dropdown_always_on_top = parse_bool(v).ok_or_else(bad)?,
+            "dropdown-hotkey" => {
+                if !v.is_empty() && crate::hotkey::parse(v).is_none() {
+                    return Err(bad());
+                }
+                self.dropdown_hotkey = v.to_string();
+            }
+            "dropdown-autostart" => self.dropdown_autostart = parse_bool(v).ok_or_else(bad)?,
             _ => return Err(format!("unknown key {key:?}")),
         }
         Ok(())
@@ -320,6 +335,8 @@ impl Config {
             "dropdown-position" => edge_name(self.dropdown_position).into(),
             "dropdown-hide-on-focus-loss" => b(self.dropdown_hide_on_focus_loss),
             "dropdown-always-on-top" => b(self.dropdown_always_on_top),
+            "dropdown-hotkey" => self.dropdown_hotkey.clone(),
+            "dropdown-autostart" => b(self.dropdown_autostart),
             _ => String::new(),
         }
     }
@@ -557,6 +574,8 @@ mod tests {
         c.foreground = Some(0xabcdef);
         c.dropdown_position = Edge::Bottom;
         c.command = "fish".into();
+        c.dropdown_hotkey = "ctrl+grave".into();
+        c.dropdown_autostart = true;
         let mut d = Config::default();
         for k in KEYS {
             let v = c.get(k);

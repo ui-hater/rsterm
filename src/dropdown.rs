@@ -1,8 +1,9 @@
 //! Dropdown (quake-style) mode: one long-lived instance that a hotkey shows
 //! and hides.
 //!
-//! Apps can't grab global hotkeys portably (and not at all on Wayland), so
-//! the hotkey is bound in the desktop to `rsterm --dropdown`. The first such
+//! The instance grabs its own hotkey on X11 (see `hotkey.rs`); binding
+//! `rsterm --dropdown` in the desktop also works (and is the only way on
+//! Wayland). The first such
 //! process takes an exclusive `flock` and listens on a Unix socket; later
 //! invocations find the lock held, send their command over the socket and
 //! exit immediately.
@@ -126,4 +127,42 @@ impl Instance {
             })
             .expect("spawn dropdown listener");
     }
+}
+
+/// XDG autostart entry that starts the dropdown hidden at login.
+fn autostart_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+    base.join("autostart").join("rsterm-dropdown.desktop")
+}
+
+/// Create or remove the autostart entry to match `enabled`.
+pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
+    let path = autostart_path();
+    if !enabled {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let exe = std::env::current_exe()?;
+    let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let text = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=rsterm dropdown\n\
+         Comment=Start the rsterm dropdown terminal hidden; show it with its hotkey\n\
+         Exec=\"{exe}\" --dropdown hide\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n"
+    );
+    if std::fs::read_to_string(&path).is_ok_and(|t| t == text) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, text)
 }

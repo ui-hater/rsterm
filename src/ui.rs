@@ -159,6 +159,13 @@ impl SettingsState {
             set("dropdown-position", "Dropdown position", s(&["top", "bottom"])),
             set("dropdown-hide-on-focus-loss", "Hide dropdown when it loses focus", Kind::Bool),
             set("dropdown-always-on-top", "Dropdown stays on top", Kind::Bool),
+            Setting {
+                key: "dropdown-hotkey",
+                label: "Dropdown hotkey (e.g. F12, ctrl+grave)",
+                kind: Kind::Text,
+                empty: "(none)",
+            },
+            set("dropdown-autostart", "Start dropdown hidden at login", Kind::Bool),
         ];
         SettingsState { sel: 0, items, editing: None, scroll: 0 }
     }

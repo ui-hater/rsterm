@@ -10,6 +10,7 @@ arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
 fontdue = "0.9.5"
 libc = "0.2.191"
+x11rb = "0.13"
 pollster = "1.0.3"
 unicode-width = "0.2.3"
 vte = "0.15.0"

@@ -3,6 +3,7 @@
 mod a11y;
 mod config;
 mod dropdown;
+mod hotkey;
 mod font;
 mod input;
 mod pty;
@@ -42,6 +43,8 @@ enum UserEvent {
     Exited(u64),
     ConfigChanged,
     Dropdown(dropdown::Cmd),
+    /// A problem worth telling the user about (e.g. the hotkey grab failed).
+    Notice(String),
     /// Debug builds only: one step of RSTERM_DEBUG_SCRIPT.
     #[cfg(debug_assertions)]
     Debug(String),
@@ -234,6 +237,8 @@ struct State {
     focus_until: Option<Instant>,
     /// Hide-on-focus-loss deadline.
     hide_at: Option<Instant>,
+    /// Sends a changed `dropdown-hotkey` to the hotkey thread.
+    hotkey_tx: Option<std::sync::mpsc::Sender<String>>,
 }
 
 fn font_px(pt: f32, scale: f64) -> f32 {
@@ -368,6 +373,16 @@ impl State {
         }
         let before = self.bar_rows();
         self.tabs.remove(i); // Drop hangs up the child
+        // The dropdown lives on (it owns the hotkey): when its last shell
+        // exits, start a fresh one and hide. Quit (Ctrl+Shift+Q) still exits.
+        let mut respawned = false;
+        if self.tabs.is_empty()
+            && self.dropdown
+            && let Ok(s) = self.spawn_session(None)
+        {
+            self.tabs.push(s);
+            respawned = true;
+        }
         if self.tabs.is_empty() {
             self.quit = true;
             return;
@@ -378,6 +393,9 @@ impl State {
         self.switch_tab(self.active);
         if self.bar_rows() != before {
             self.apply_size();
+        }
+        if respawned {
+            self.hide_dropdown();
         }
     }
 
@@ -419,8 +437,18 @@ impl State {
             if !c.dropdown_hide_on_focus_loss {
                 self.hide_at = None;
             }
+            if c.dropdown_hotkey != old.dropdown_hotkey {
+                if let Some(tx) = &self.hotkey_tx {
+                    let _ = tx.send(c.dropdown_hotkey.clone());
+                }
+            }
         } else if old.decorations != self.cfg.decorations {
             self.window.set_decorations(self.cfg.decorations);
+        }
+        if old.dropdown_autostart != self.cfg.dropdown_autostart {
+            if let Err(e) = dropdown::set_autostart(self.cfg.dropdown_autostart) {
+                self.announce(format!("Could not change autostart: {e}"));
+            }
         }
         if old.scrollback != self.cfg.scrollback {
             for s in &self.tabs {
@@ -1582,6 +1610,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     state: Option<State>,
     dropdown: bool,
+    /// The command the dropdown was started with (`hide` starts hidden).
+    initial: Option<dropdown::Cmd>,
 }
 
 impl App {
@@ -1667,12 +1697,30 @@ impl App {
             shown: false,
             focus_until: None,
             hide_at: None,
+            hotkey_tx: None,
         };
         let s = st.spawn_session(None).expect("spawn shell");
         st.tabs.push(s);
+        if let Err(e) = dropdown::set_autostart(st.cfg.dropdown_autostart) {
+            eprintln!("rsterm: could not update autostart entry: {e}");
+        }
         if dropdown {
-            // The first `rsterm --dropdown` is itself a hotkey press: appear.
-            st.show_dropdown();
+            if std::env::var_os("DISPLAY").is_some() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let p = self.proxy.clone();
+                hotkey::spawn(st.cfg.dropdown_hotkey.clone(), rx, move |m| {
+                    let _ = p.send_event(match m {
+                        hotkey::Msg::Pressed => UserEvent::Dropdown(dropdown::Cmd::Toggle),
+                        hotkey::Msg::Error(e) => UserEvent::Notice(e),
+                    });
+                });
+                st.hotkey_tx = Some(tx);
+            }
+            // The first `rsterm --dropdown` is itself a hotkey press: appear,
+            // unless started with `hide` (autostart at login).
+            if self.initial != Some(dropdown::Cmd::Hide) {
+                st.show_dropdown();
+            }
         }
         if let Some(e) = errors.first() {
             st.announce(format!("Config error, {e}"));
@@ -1699,6 +1747,10 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::ConfigChanged => st.reload_config(false),
             UserEvent::Dropdown(cmd) => st.dropdown_cmd(cmd),
+            UserEvent::Notice(msg) => {
+                eprintln!("rsterm: {msg}");
+                st.announce(msg);
+            }
             #[cfg(debug_assertions)]
             UserEvent::Debug(step) => st.debug_step(&step),
             UserEvent::AccessKit(ev) => match ev.window_event {
@@ -1841,11 +1893,14 @@ fn main() {
         println!(
             "usage: rsterm [--dropdown [toggle|show|hide]] [--bench FILE]\n\n  \
              --dropdown   quake-style terminal: the first call starts it, later calls\n               \
-             toggle/show/hide it. Bind `rsterm --dropdown` to a global hotkey."
+             toggle/show/hide it. The dropdown grabs its own global hotkey\n               \
+             (config `dropdown-hotkey`, default F12); `--dropdown hide` starts it\n               \
+             hidden (used by `dropdown-autostart`)."
         );
         return;
     }
     let mut instance = None;
+    let mut initial = None;
     let dropdown = args.get(1).is_some_and(|a| a == "--dropdown");
     if dropdown {
         let cmd = match args.get(2) {
@@ -1855,6 +1910,7 @@ fn main() {
                 std::process::exit(2)
             }),
         };
+        initial = Some(cmd);
         match dropdown::claim(cmd) {
             Ok(dropdown::Role::Forwarded) => return,
             Ok(dropdown::Role::Primary(i)) => instance = Some(i),
@@ -1879,6 +1935,6 @@ fn main() {
             let _ = p.send_event(UserEvent::Dropdown(cmd));
         });
     }
-    let mut app = App { proxy, state: None, dropdown };
+    let mut app = App { proxy, state: None, dropdown, initial };
     event_loop.run_app(&mut app).expect("run");
 }
