@@ -35,6 +35,8 @@ const SETTING_BASE: u64 = 300;
 /// TextRun child of the settings text field at index i (one per field:
 /// AccessKit rejects a tree where two nodes share a child id).
 const SETTING_TEXT_BASE: u64 = 400;
+/// Read-only TextInput child of the settings combo box at index i.
+const SETTING_COMBO_TEXT_BASE: u64 = 500;
 
 pub fn term_node(tab_id: u64) -> NodeId {
     NodeId((tab_id + 1) << 32)
@@ -316,8 +318,23 @@ impl A11y {
                             n
                         }
                         Kind::Choice(_) => {
+                            // Orca speaks a combo box's value from the text of
+                            // its single text-input child (as with GTK entry
+                            // combos); AccessKit gives ComboBox itself no Text
+                            // interface, so a bare set_value is never spoken.
                             let mut n = Node::new(Role::ComboBox);
                             n.set_value(value.clone());
+                            let b = row_rect.unwrap_or_default();
+                            let field_id = NodeId(SETTING_COMBO_TEXT_BASE + i as u64);
+                            let mut field = Node::new(Role::TextInput);
+                            field.set_read_only();
+                            field.set_label(it.label.to_string());
+                            field.set_value(value.clone());
+                            field.set_bounds(b);
+                            let run = NodeId(SETTING_TEXT_BASE + i as u64);
+                            nodes.push(text_field(&mut field, run, &value, b, g.cell_w));
+                            nodes.push((field_id, field));
+                            n.set_children(vec![field_id]);
                             n
                         }
                         Kind::Text => {

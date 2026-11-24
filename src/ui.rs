@@ -206,6 +206,14 @@ impl SettingsState {
         };
         new != cur && cfg.set(it.key, &new).is_ok()
     }
+
+    /// The selected setting's value in `cfg` if it is a choice. Screen
+    /// readers don't speak a combo box's new value on their own (it has no
+    /// selected child), so changes to it are announced.
+    pub fn choice_value(&self, cfg: &Config) -> Option<String> {
+        let it = &self.items[self.sel];
+        matches!(it.kind, Kind::Choice(_)).then(|| cfg.get(it.key))
+    }
 }
 
 pub fn fmt_num(v: f64) -> String {

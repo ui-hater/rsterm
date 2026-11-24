@@ -988,7 +988,11 @@ impl State {
                         };
                         let mut cfg = self.cfg.clone();
                         if s.adjust(&mut cfg, dir) {
+                            let spoken = s.choice_value(&cfg);
                             self.apply_config(cfg, true);
+                            if let Some(v) = spoken {
+                                self.announce(v);
+                            }
                         }
                     }
                     Some(NamedKey::Enter) | Some(NamedKey::Space) => match s.items[s.sel].kind {
@@ -996,7 +1000,11 @@ impl State {
                         _ => {
                             let mut cfg = self.cfg.clone();
                             if s.adjust(&mut cfg, 1) {
+                                let spoken = s.choice_value(&cfg);
                                 self.apply_config(cfg, true);
+                                if let Some(v) = spoken {
+                                    self.announce(v);
+                                }
                             }
                         }
                     },
@@ -1095,7 +1103,11 @@ impl State {
                             let dir = if button == MouseButton::Right { -1 } else { 1 };
                             let mut cfg = self.cfg.clone();
                             if s.adjust(&mut cfg, dir) {
+                                let spoken = s.choice_value(&cfg);
                                 self.apply_config(cfg, true);
+                                if let Some(v) = spoken {
+                                    self.announce(v);
+                                }
                             }
                         }
                     }
