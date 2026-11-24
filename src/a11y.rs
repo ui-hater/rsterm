@@ -268,7 +268,9 @@ impl A11y {
                     kids.push(id);
                     let mut n = Node::new(Role::MenuItem);
                     n.set_label(it.label.trim_end_matches('…').to_string());
-                    n.set_keyboard_shortcut(it.shortcut.to_string());
+                    if let Some(sc) = m.shortcuts.get(i).filter(|s| !s.is_empty()) {
+                        n.set_keyboard_shortcut(sc.clone());
+                    }
                     n.set_position_in_set(pos + 1);
                     n.set_size_of_set(real.len());
                     n.add_action(Action::Click);

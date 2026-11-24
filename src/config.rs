@@ -64,6 +64,8 @@ pub struct Config {
     pub desktop_notifications: bool,
     /// Inject prompt marks (OSC 133) into zsh and bash.
     pub shell_integration: bool,
+    /// `keybind` entries in file order, applied on top of the defaults.
+    pub keybinds: Vec<String>,
 }
 
 impl Default for Config {
@@ -105,6 +107,7 @@ impl Default for Config {
             dropdown_animation: 0.2,
             desktop_notifications: true,
             shell_integration: true,
+            keybinds: Vec::new(),
         }
     }
 }
@@ -193,6 +196,7 @@ pub const KEYS: &[&str] = &[
     "dropdown-animation-duration",
     "desktop-notifications",
     "shell-integration",
+    "keybind",
 ];
 
 pub fn tab_bar_name(t: TabBar) -> &'static str {
@@ -320,6 +324,15 @@ impl Config {
                     _ => return Err(bad()),
                 }
             }
+            "keybind" => {
+                // Repeatable. An empty value resets to the default bindings.
+                if v.is_empty() {
+                    self.keybinds.clear();
+                } else {
+                    crate::keybind::parse_entry(v)?;
+                    self.keybinds.push(v.to_string());
+                }
+            }
             _ => return Err(format!("unknown key {key:?}")),
         }
         Ok(())
@@ -367,6 +380,15 @@ impl Config {
         }
     }
 
+    /// Every value `key` has, as written by `save` (one line each).
+    /// Only `keybind` can have several, or none.
+    pub fn values(&self, key: &str) -> Vec<String> {
+        match key {
+            "keybind" => self.keybinds.clone(),
+            _ => vec![self.get(key)],
+        }
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_path();
         if let Some(dir) = path.parent() {
@@ -377,7 +399,15 @@ impl Config {
              # hand edits are fine and are picked up automatically.\n",
         );
         for k in KEYS {
-            text.push_str(&format!("{k} = {}\n", self.get(k)));
+            if *k == "keybind" {
+                text.push_str(
+                    "# Key bindings (repeatable), e.g. keybind = ctrl+t=new_tab,\n\
+                     # keybind = ctrl+shift+t=unbind, keybind = alt+left=text:\\x1bb\n",
+                );
+            }
+            for v in self.values(k) {
+                text.push_str(&format!("{k} = {v}\n"));
+            }
         }
         // Write atomically so the watcher never sees a half-written file.
         let tmp = path.with_extension("tmp");
@@ -605,10 +635,12 @@ mod tests {
         c.dropdown_animation = 0.35;
         c.desktop_notifications = false;
         c.shell_integration = false;
+        c.keybinds = vec!["ctrl+t=new_tab".into(), "ctrl+shift+t=unbind".into()];
         let mut d = Config::default();
         for k in KEYS {
-            let v = c.get(k);
-            d.set(k, &v).unwrap_or_else(|e| panic!("{k}: {e}"));
+            for v in c.values(k) {
+                d.set(k, &v).unwrap_or_else(|e| panic!("{k}: {e}"));
+            }
         }
         assert_eq!(c, d);
     }

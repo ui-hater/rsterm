@@ -323,6 +323,8 @@ pub struct Term {
     /// Desktop notifications requested by the application (OSC 9 / 777):
     /// (title, body), drained by the UI.
     pub notifications: Vec<(String, String)>,
+    /// Kitty keyboard protocol flag stacks for the main and alternate screen.
+    kitty_kbd: [Vec<u8>; 2],
     /// Absolute line of the prompt last jumped to (cleared on typing).
     prompt_nav: Option<i64>,
     /// Synchronized output (mode 2026): when it began, if active.
@@ -333,6 +335,8 @@ pub struct Term {
 }
 
 const SCROLLBACK: usize = 10_000;
+/// Depth of each kitty keyboard flag stack; the oldest entry is dropped.
+const KITTY_STACK: usize = 16;
 
 impl Term {
     pub fn new(cols: usize, rows: usize) -> Term {
@@ -379,6 +383,7 @@ impl Term {
             clipboard_request: None,
             notifications: Vec::new(),
             prompt_nav: None,
+            kitty_kbd: [Vec::new(), Vec::new()],
             sync_since: None,
             generation: 1,
             last_printed: ' ',
@@ -567,6 +572,11 @@ impl Term {
             let clip = |s: String| s.chars().filter(|c| !c.is_control()).take(500).collect::<String>();
             self.notifications.push((clip(title), clip(body)));
         }
+    }
+
+    /// Active kitty keyboard protocol flags (0 = legacy encoding).
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_kbd[self.alt_active as usize].last().copied().unwrap_or(0)
     }
 
     /// Scroll the view to the previous (`dir < 0`) or next shell prompt
@@ -1756,6 +1766,37 @@ impl Perform for Term {
                     self.goto(0, 0);
                 }
             }
+            ('u', [b'?']) => {
+                let f = self.kitty_flags();
+                self.responses.extend_from_slice(format!("\x1b[?{f}u").as_bytes());
+            }
+            ('u', [b'>']) => {
+                let f = (arg(params, 0, 0) & 0x1f) as u8;
+                let st = &mut self.kitty_kbd[self.alt_active as usize];
+                if st.len() >= KITTY_STACK {
+                    st.remove(0);
+                }
+                st.push(f);
+            }
+            ('u', [b'<']) => {
+                let st = &mut self.kitty_kbd[self.alt_active as usize];
+                let n = (arg(params, 0, 1) as usize).max(1).min(st.len());
+                st.truncate(st.len() - n);
+            }
+            ('u', [b'=']) => {
+                let f = (arg(params, 0, 0) & 0x1f) as u8;
+                let st = &mut self.kitty_kbd[self.alt_active as usize];
+                if st.is_empty() {
+                    st.push(0);
+                }
+                let top = st.last_mut().unwrap();
+                match arg(params, 1, 1) {
+                    1 => *top = f,
+                    2 => *top |= f,
+                    3 => *top &= !f,
+                    _ => {}
+                }
+            }
             ('s', []) => self.save_cursor(),
             ('u', []) => self.restore_cursor(),
             ('t', []) => {
@@ -2055,5 +2096,27 @@ mod tests {
             t.notifications,
             vec![(String::new(), "build done".into()), ("Make".into(), "ok; really".into())]
         );
+    }
+
+    #[test]
+    fn kitty_keyboard_flag_stack() {
+        let (mut t, mut p) = term(10, 3);
+        feed(&mut t, &mut p, "\x1b[?u");
+        feed(&mut t, &mut p, "\x1b[>1u\x1b[>11u");
+        assert_eq!(t.kitty_flags(), 11);
+        feed(&mut t, &mut p, "\x1b[=4;2u");
+        assert_eq!(t.kitty_flags(), 15);
+        feed(&mut t, &mut p, "\x1b[=2;3u");
+        assert_eq!(t.kitty_flags(), 13);
+        // The alternate screen has its own stack.
+        feed(&mut t, &mut p, "\x1b[?1049h");
+        assert_eq!(t.kitty_flags(), 0);
+        feed(&mut t, &mut p, "\x1b[>8u\x1b[?u\x1b[?1049l");
+        assert_eq!(t.kitty_flags(), 13);
+        feed(&mut t, &mut p, "\x1b[<u");
+        assert_eq!(t.kitty_flags(), 1);
+        feed(&mut t, &mut p, "\x1b[<5u\x1b[?u");
+        assert_eq!(t.kitty_flags(), 0);
+        assert_eq!(String::from_utf8_lossy(&t.responses), "\x1b[?0u\x1b[?8u\x1b[?0u");
     }
 }

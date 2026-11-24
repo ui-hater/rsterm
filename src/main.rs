@@ -6,6 +6,7 @@ mod dropdown;
 mod hotkey;
 mod font;
 mod input;
+mod keybind;
 mod pty;
 mod render;
 mod session;
@@ -242,6 +243,11 @@ struct State {
     hotkey_tx: Option<std::sync::mpsc::Sender<String>>,
     /// How far the dropdown is slid in: 0 = off screen, 1 = in place.
     slide_pos: f32,
+    /// Key bindings built from the defaults and `keybind` entries.
+    binds: keybind::Bindings,
+    /// Keys whose press ran a binding; their releases aren't sent to the
+    /// program (kitty event reporting would otherwise see a lone release).
+    consumed_keys: Vec<winit::keyboard::KeyCode>,
     /// The slide animation in progress, if any.
     slide: Option<Slide>,
     /// Monitor the dropdown belongs to. Remembered because while slid out
@@ -482,6 +488,9 @@ impl State {
                 self.announce(format!("Could not change autostart: {e}"));
             }
         }
+        if old.keybinds != self.cfg.keybinds {
+            self.binds = keybind::Bindings::new(&self.cfg.keybinds);
+        }
         if old.scrollback != self.cfg.scrollback {
             for s in &self.tabs {
                 s.shared.term.lock().unwrap().set_scrollback(self.cfg.scrollback);
@@ -561,6 +570,18 @@ impl State {
                 drop(t);
                 self.announce("Scrollback cleared");
             }
+            Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom => {
+                let mut t = self.session().shared.term.lock().unwrap();
+                let page = t.rows() as isize - 1;
+                t.scroll_view(match a {
+                    Action::ScrollPageUp => page,
+                    Action::ScrollPageDown => -page,
+                    Action::ScrollTop => isize::MAX / 2,
+                    _ => -(isize::MAX / 2),
+                });
+                drop(t);
+                self.window.request_redraw();
+            }
             Action::PrevPrompt | Action::NextPrompt => {
                 let dir = if a == Action::PrevPrompt { -1 } else { 1 };
                 let r = self.session().shared.term.lock().unwrap().jump_to_prompt(dir);
@@ -594,13 +615,34 @@ impl State {
                     Some(self.mouse_cell_or_cursor())
                 };
                 self.overlay = match at {
-                    Some(at) => Overlay::Menu(ui::MenuState { sel: 0, at }),
+                    Some(at) => Overlay::Menu(ui::MenuState { sel: 0, at, shortcuts: self.menu_shortcuts() }),
                     None => Overlay::None,
                 };
                 self.touch_ui();
             }
             Action::Quit => self.quit = true,
         }
+    }
+
+    /// Run a bound action if it applies right now. Returns false when it
+    /// doesn't (e.g. Alt+3 with fewer than 3 tabs, Shift+PageUp on the
+    /// alternate screen), so the key goes to the program instead.
+    fn perform(&mut self, a: Action) -> bool {
+        let applies = match a {
+            Action::GotoTab(i) => self.tabs.len() > 1 && (i == usize::MAX || i < self.tabs.len()),
+            Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom => {
+                !self.session().shared.term.lock().unwrap().alt_active
+            }
+            _ => true,
+        };
+        if applies {
+            self.run(a);
+        }
+        applies
+    }
+
+    fn menu_shortcuts(&self) -> Vec<String> {
+        ui::MENU.iter().map(|it| it.action.map(|a| self.binds.label(a)).unwrap_or_default()).collect()
     }
 
     /// Where to pop up a keyboard-invoked menu: the mouse if it's inside the
@@ -754,13 +796,35 @@ impl State {
     // -- keyboard -----------------------------------------------------------------
 
     fn on_key(&mut self, ev: &winit::event::KeyEvent) {
+        let code = match ev.physical_key {
+            winit::keyboard::PhysicalKey::Code(c) => Some(c),
+            _ => None,
+        };
+        let bound = code.and_then(|c| self.binds.lookup(keybind::mod_bits(self.modifiers), c)).cloned();
         if ev.state != ElementState::Pressed {
+            if let Some(i) = code.and_then(|c| self.consumed_keys.iter().position(|&k| k == c)) {
+                self.consumed_keys.swap_remove(i);
+                return;
+            }
+            // Releases only matter to programs using kitty event reporting.
+            if matches!(self.overlay, Overlay::None) {
+                let (flags, app_cursor) = {
+                    let t = self.session().shared.term.lock().unwrap();
+                    (t.kitty_flags(), t.app_cursor)
+                };
+                if flags & input::kitty::EVENT_TYPES != 0 {
+                    let bytes = input::encode_kitty(ev, self.modifiers, flags, app_cursor);
+                    if !bytes.is_empty() {
+                        self.write(&bytes);
+                    }
+                }
+            }
             return;
         }
         self.blink_epoch = Instant::now();
         if !matches!(self.overlay, Overlay::None) {
             // Clipboard paste works inside search / text fields.
-            if let Some(Action::Paste) = input::shortcut(ev, self.modifiers, self.tabs.len()) {
+            if bound == Some(keybind::Bound::Action(Action::Paste)) {
                 self.paste(false);
                 return;
             }
@@ -772,33 +836,30 @@ impl State {
             self.overlay_key(named, text.as_deref());
             return;
         }
-        if let Some(a) = input::shortcut(ev, self.modifiers, self.tabs.len()) {
-            self.run(a);
+        let consumed = match bound {
+            Some(keybind::Bound::Action(a)) => self.perform(a),
+            Some(keybind::Bound::Text(bytes)) => {
+                self.write(&bytes);
+                true
+            }
+            Some(keybind::Bound::Ignore) => true,
+            None => false,
+        };
+        if consumed {
+            if let Some(c) = code.filter(|c| !self.consumed_keys.contains(c)) {
+                self.consumed_keys.push(c);
+            }
             return;
         }
-        // Scrollback navigation.
-        let m = self.modifiers;
-        if m.shift_key() && !m.control_key() && !m.alt_key() {
-            if let Key::Named(k) = &ev.logical_key {
-                let mut t = self.session().shared.term.lock().unwrap();
-                let page = t.rows() as isize - 1;
-                let d = match k {
-                    NamedKey::PageUp => Some(page),
-                    NamedKey::PageDown => Some(-page),
-                    NamedKey::Home if !t.alt_active => Some(isize::MAX / 2),
-                    NamedKey::End if !t.alt_active => Some(-(isize::MAX / 2)),
-                    _ => None,
-                };
-                if let Some(d) = d {
-                    t.scroll_view(d);
-                    drop(t);
-                    self.window.request_redraw();
-                    return;
-                }
-            }
-        }
-        let app_cursor = self.session().shared.term.lock().unwrap().app_cursor;
-        let bytes = input::encode(ev, self.modifiers, app_cursor);
+        let (flags, app_cursor) = {
+            let t = self.session().shared.term.lock().unwrap();
+            (t.kitty_flags(), t.app_cursor)
+        };
+        let bytes = if flags != 0 {
+            input::encode_kitty(ev, self.modifiers, flags, app_cursor)
+        } else {
+            input::encode(ev, self.modifiers, app_cursor)
+        };
         if bytes.is_empty() {
             return;
         }
@@ -1126,7 +1187,7 @@ impl State {
             }
             (MouseButton::Middle, true) => self.paste(true),
             (MouseButton::Right, true) => {
-                self.overlay = Overlay::Menu(ui::MenuState { sel: 0, at: cell });
+                self.overlay = Overlay::Menu(ui::MenuState { sel: 0, at: cell, shortcuts: self.menu_shortcuts() });
                 self.touch_ui();
             }
             _ => {}
@@ -1794,6 +1855,7 @@ impl App {
 
         #[cfg(debug_assertions)]
         start_debug_script(self.proxy.clone());
+        let binds = keybind::Bindings::new(&cfg.keybinds);
         let mut st = State {
             window,
             renderer,
@@ -1837,6 +1899,8 @@ impl App {
             focus_until: None,
             hide_at: None,
             hotkey_tx: None,
+            binds,
+            consumed_keys: Vec::new(),
             slide_pos: 1.0,
             slide: None,
             monitor: None,
@@ -1933,6 +1997,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 st.focused = f;
+                st.consumed_keys.clear();
                 st.blink_epoch = Instant::now();
                 let report = st.session().shared.term.lock().unwrap().focus_events;
                 if report {

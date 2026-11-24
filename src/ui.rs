@@ -27,43 +27,46 @@ pub enum Action {
     ClearScrollback,
     PrevPrompt,
     NextPrompt,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollTop,
+    ScrollBottom,
     OpenMenu,
     Quit,
 }
 
 pub struct MenuItem {
     pub label: &'static str,
-    pub shortcut: &'static str,
     /// None = separator.
     pub action: Option<Action>,
 }
 
-const fn item(label: &'static str, shortcut: &'static str, a: Action) -> MenuItem {
-    MenuItem { label, shortcut, action: Some(a) }
+const fn item(label: &'static str, a: Action) -> MenuItem {
+    MenuItem { label, action: Some(a) }
 }
-const SEP: MenuItem = MenuItem { label: "", shortcut: "", action: None };
+const SEP: MenuItem = MenuItem { label: "", action: None };
 
 pub const MENU: &[MenuItem] = &[
-    item("New Tab", "Ctrl+Shift+T", Action::NewTab),
-    item("Close Tab", "Ctrl+Shift+W", Action::CloseTab),
-    item("Next Tab", "Ctrl+Tab", Action::NextTab),
-    item("Previous Tab", "Ctrl+Shift+Tab", Action::PrevTab),
+    item("New Tab", Action::NewTab),
+    item("Close Tab", Action::CloseTab),
+    item("Next Tab", Action::NextTab),
+    item("Previous Tab", Action::PrevTab),
     SEP,
-    item("Copy", "Ctrl+Shift+C", Action::Copy),
-    item("Paste", "Ctrl+Shift+V", Action::Paste),
-    item("Select All", "Ctrl+Shift+A", Action::SelectAll),
-    item("Find…", "Ctrl+Shift+F", Action::Find),
-    item("Clear Scrollback", "Ctrl+Shift+K", Action::ClearScrollback),
-    item("Previous Prompt", "Ctrl+Shift+PageUp", Action::PrevPrompt),
-    item("Next Prompt", "Ctrl+Shift+PageDown", Action::NextPrompt),
+    item("Copy", Action::Copy),
+    item("Paste", Action::Paste),
+    item("Select All", Action::SelectAll),
+    item("Find…", Action::Find),
+    item("Clear Scrollback", Action::ClearScrollback),
+    item("Previous Prompt", Action::PrevPrompt),
+    item("Next Prompt", Action::NextPrompt),
     SEP,
-    item("Zoom In", "Ctrl+Shift+=", Action::ZoomIn),
-    item("Zoom Out", "Ctrl+Shift+-", Action::ZoomOut),
-    item("Reset Zoom", "Ctrl+Shift+0", Action::ZoomReset),
+    item("Zoom In", Action::ZoomIn),
+    item("Zoom Out", Action::ZoomOut),
+    item("Reset Zoom", Action::ZoomReset),
     SEP,
-    item("Settings…", "Ctrl+,", Action::Settings),
-    item("Reload Config", "Ctrl+Shift+,", Action::ReloadConfig),
-    item("Quit", "Ctrl+Shift+Q", Action::Quit),
+    item("Settings…", Action::Settings),
+    item("Reload Config", Action::ReloadConfig),
+    item("Quit", Action::Quit),
 ];
 
 pub fn menu_step(sel: usize, dir: isize) -> usize {
@@ -83,6 +86,8 @@ pub fn menu_step(sel: usize, dir: isize) -> usize {
 
 pub struct MenuState {
     pub sel: usize,
+    /// Shortcut label per MENU item, from the current key bindings.
+    pub shortcuts: Vec<String>,
     /// Requested top-left cell (window grid coordinates).
     pub at: (usize, usize),
 }
@@ -268,7 +273,12 @@ pub fn tab_bar_layout(cols: usize, n: usize) -> TabBarLayout {
 }
 
 pub fn menu_rect(m: &MenuState, cols: usize, rows: usize) -> CellRect {
-    let inner = MENU.iter().map(|i| i.label.chars().count() + i.shortcut.chars().count() + 4).max().unwrap_or(10);
+    let inner = MENU
+        .iter()
+        .zip(&m.shortcuts)
+        .map(|(i, sc)| i.label.chars().count() + sc.chars().count() + 4)
+        .max()
+        .unwrap_or(10);
     let w = (inner + 2).min(cols);
     let h = (MENU.len() + 2).min(rows);
     let x = m.at.0.min(cols - w);
@@ -397,8 +407,9 @@ impl Painter<'_> {
             let (fg, bg) = if i == m.sel { (c.accent_fg, c.accent_bg) } else { (c.fg, c.panel) };
             self.fill((x + 1, yy, w - 2, 1), bg);
             self.text(x + 2, yy, it.label, w - 4, fg, bg, 0);
-            let sc = it.shortcut.chars().count();
-            self.text(x + w - 2 - sc, yy, it.shortcut, sc, if i == m.sel { fg } else { c.dim }, bg, 0);
+            let shortcut = m.shortcuts.get(i).map_or("", String::as_str);
+            let sc = shortcut.chars().count();
+            self.text(x + w - 2 - sc, yy, shortcut, sc, if i == m.sel { fg } else { c.dim }, bg, 0);
         }
     }
 

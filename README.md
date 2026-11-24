@@ -19,6 +19,8 @@ A GPU-rendered terminal emulator for Linux, built around two goals: raw throughp
 - Shell integration for zsh and bash (loaded automatically, no dotfile changes): jump between prompts in the scrollback, and each prompt you land on is read aloud
 - Desktop notifications from programs (OSC 9 and OSC 777). When you're looking at that tab they're spoken instead of shown as a popup
 - Config file that is reloaded automatically when it changes
+- Configurable key bindings (Ghostty's `keybind` syntax)
+- Kitty keyboard protocol, so programs such as Neovim, Helix and fish can tell every key combination apart and get key release events
 
 ## Building
 
@@ -66,6 +68,8 @@ rsterm --bench FILE       # headless parser benchmark, prints MB/s
 
 Closing the last shell in the dropdown starts a new one and hides the window. Use Quit to really exit.
 
+All of these can be changed with `keybind` (see below). The menu shows the shortcuts that are currently bound.
+
 ## Configuration
 
 The config file is `$XDG_CONFIG_HOME/rsterm/config` (usually `~/.config/rsterm/config`). It is created with the default values on first start, uses `key = value` lines (`#` starts a comment line), and is reloaded automatically when it changes. The settings screen (Ctrl+,) edits the same file.
@@ -87,7 +91,25 @@ dropdown-position = top
 dropdown-hotkey = F12
 ```
 
-All keys: `font-family`, `font-size`, `theme`, `foreground`, `background`, `cursor-color`, `selection-foreground`, `selection-background`, `scrollback-limit`, `cursor-style`, `cursor-style-blink`, `window-padding`, `window-width`, `window-height`, `window-decorations`, `tab-bar`, `copy-on-select`, `mouse-hide-while-typing`, `mouse-scroll-multiplier`, `visual-bell`, `bold-is-bright`, `window-inherit-working-directory`, `clipboard-write`, `command`, `dropdown-width`, `dropdown-height`, `dropdown-position`, `dropdown-hide-on-focus-loss`, `dropdown-always-on-top`, `dropdown-hotkey`, `dropdown-autostart`, `dropdown-animation-duration`, `desktop-notifications`, `shell-integration` (`detect` or `none`).
+All keys: `font-family`, `font-size`, `theme`, `foreground`, `background`, `cursor-color`, `selection-foreground`, `selection-background`, `scrollback-limit`, `cursor-style`, `cursor-style-blink`, `window-padding`, `window-width`, `window-height`, `window-decorations`, `tab-bar`, `copy-on-select`, `mouse-hide-while-typing`, `mouse-scroll-multiplier`, `visual-bell`, `bold-is-bright`, `window-inherit-working-directory`, `clipboard-write`, `command`, `dropdown-width`, `dropdown-height`, `dropdown-position`, `dropdown-hide-on-focus-loss`, `dropdown-always-on-top`, `dropdown-hotkey`, `dropdown-autostart`, `dropdown-animation-duration`, `desktop-notifications`, `shell-integration` (`detect` or `none`), `keybind`.
+
+### Key bindings
+
+`keybind` can be given any number of times. Entries apply in order, on top of the default shortcuts listed above:
+
+```ini
+keybind = ctrl+t=new_tab                 # add a binding
+keybind = ctrl+shift+t=unbind            # remove one; the key goes to the program
+keybind = alt+left=text:\x1bb            # send bytes (\n \r \t \e \\ \xHH \u{HEX})
+keybind = ctrl+shift+u=csi:2J             # also esc:..., ignore
+keybind = clear                          # remove every binding, including defaults
+```
+
+Triggers are modifiers (`ctrl`, `shift`, `alt`, `super`) joined with `+` and a key. Keys are named by their position on a US keyboard: `a`–`z`, `0`–`9`, `f1`–`f12`, `equal`, `minus`, `comma`, `period`, `slash`, `backslash`, `semicolon`, `apostrophe`, `grave`, `bracket_left`, `bracket_right`, `space`, `enter`, `tab`, `escape`, `backspace`, `insert`, `delete`, `home`, `end`, `page_up`, `page_down`, `up`, `down`, `left`, `right`, `context_menu`.
+
+Actions: `new_tab`, `close_tab`, `next_tab`, `previous_tab`, `goto_tab:N`, `last_tab`, `copy_to_clipboard`, `paste_from_clipboard`, `select_all`, `start_search`, `clear_screen`, `jump_to_prompt:-1` / `jump_to_prompt:1`, `scroll_page_up`, `scroll_page_down`, `scroll_to_top`, `scroll_to_bottom`, `increase_font_size:1`, `decrease_font_size:1`, `reset_font_size`, `open_config`, `reload_config`, `open_menu`, `quit`, `text:...`, `csi:...`, `esc:...`, `ignore`, `unbind`.
+
+Tab and scroll bindings let the key through to the program when they can't do anything (Alt+3 with fewer than three tabs, Shift+PageUp in full-screen programs).
 
 ### Shell integration
 
