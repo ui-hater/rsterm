@@ -29,10 +29,12 @@ const SETTINGS: NodeId = NodeId(5);
 const SEARCH: NodeId = NodeId(6);
 const STATUS: NodeId = NodeId(7);
 const SEARCH_TEXT: NodeId = NodeId(8);
-const SETTING_TEXT: NodeId = NodeId(9);
 pub const TAB_BASE: u64 = 100;
 pub const MENU_ITEM_BASE: u64 = 200;
 const SETTING_BASE: u64 = 300;
+/// TextRun child of the settings text field at index i (one per field:
+/// AccessKit rejects a tree where two nodes share a child id).
+const SETTING_TEXT_BASE: u64 = 400;
 
 pub fn term_node(tab_id: u64) -> NodeId {
     NodeId((tab_id + 1) << 32)
@@ -288,8 +290,12 @@ impl A11y {
                 );
                 d.set_bounds(g.cells(rect));
                 let mut kids = Vec::new();
+                let vis = ui::settings_visible(rect.3);
                 for (i, it) in s.items.iter().enumerate() {
                     let id = NodeId(SETTING_BASE + i as u64);
+                    let row = i as isize - s.scroll as isize;
+                    let row_rect = (row >= 0 && (row as usize) < vis)
+                        .then(|| g.cells((rect.0 + 1, rect.1 + 2 + row as usize, rect.2 - 2, 1)));
                     kids.push(id);
                     let value = ui.cfg.get(it.key);
                     let mut n = match &it.kind {
@@ -318,8 +324,9 @@ impl A11y {
                                 (Some(e), true) => e.clone(),
                                 _ => value.clone(),
                             };
-                            let b = g.cells((rect.0 + 1, rect.1 + 2, rect.2 - 2, 1));
-                            nodes.push(text_field(&mut n, SETTING_TEXT, &v, b, g.cell_w));
+                            let b = row_rect.unwrap_or_default();
+                            let run = NodeId(SETTING_TEXT_BASE + i as u64);
+                            nodes.push(text_field(&mut n, run, &v, b, g.cell_w));
                             if !it.empty.is_empty() {
                                 n.set_placeholder(it.empty.trim_matches(['(', ')']).to_string());
                             }
@@ -331,9 +338,8 @@ impl A11y {
                     n.set_position_in_set(i + 1);
                     n.set_size_of_set(s.items.len());
                     n.add_action(Action::Focus);
-                    let row = i as isize - s.scroll as isize;
-                    if row >= 0 && (row as usize) < ui::settings_visible(rect.3) {
-                        n.set_bounds(g.cells((rect.0 + 1, rect.1 + 2 + row as usize, rect.2 - 2, 1)));
+                    if let Some(b) = row_rect {
+                        n.set_bounds(b);
                     }
                     nodes.push((id, n));
                 }
