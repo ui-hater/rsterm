@@ -13,6 +13,12 @@ pub enum TabBar {
     Never,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub font_family: String,
@@ -29,6 +35,25 @@ pub struct Config {
     pub inherit_cwd: bool,
     pub clipboard_write: bool,
     pub command: String,
+    /// Initial window size in cells.
+    pub window_cols: usize,
+    pub window_rows: usize,
+    pub decorations: bool,
+    pub mouse_hide_while_typing: bool,
+    /// Lines scrolled per mouse wheel notch.
+    pub scroll_multiplier: f32,
+    /// Overrides for the theme's colors (None = use the theme).
+    pub foreground: Option<u32>,
+    pub background: Option<u32>,
+    pub cursor_color: Option<u32>,
+    pub selection_fg: Option<u32>,
+    pub selection_bg: Option<u32>,
+    /// Dropdown window size as a percentage of the monitor.
+    pub dropdown_width: f32,
+    pub dropdown_height: f32,
+    pub dropdown_position: Edge,
+    pub dropdown_hide_on_focus_loss: bool,
+    pub dropdown_always_on_top: bool,
 }
 
 impl Default for Config {
@@ -48,6 +73,23 @@ impl Default for Config {
             inherit_cwd: true,
             clipboard_write: true,
             command: String::new(),
+            window_cols: 100,
+            window_rows: 30,
+            decorations: true,
+            mouse_hide_while_typing: true,
+            scroll_multiplier: 3.0,
+            foreground: None,
+            background: None,
+            cursor_color: None,
+            selection_fg: None,
+            selection_bg: None,
+            dropdown_width: 100.0,
+            dropdown_height: 40.0,
+            dropdown_position: Edge::Top,
+            // Off by default: a window vanishing whenever focus moves (e.g. to
+            // a screen reader popup or a notification) is disorienting.
+            dropdown_hide_on_focus_loss: false,
+            dropdown_always_on_top: true,
         }
     }
 }
@@ -75,6 +117,63 @@ pub fn cursor_name(c: CursorShape) -> &'static str {
         CursorShape::Bar => "bar",
     }
 }
+
+pub fn edge_name(e: Edge) -> &'static str {
+    match e {
+        Edge::Top => "top",
+        Edge::Bottom => "bottom",
+    }
+}
+
+/// Parse `#rrggbb` / `rrggbb`; empty means "unset".
+fn parse_color(v: &str) -> Result<Option<u32>, ()> {
+    if v.is_empty() {
+        return Ok(None);
+    }
+    let h = v.strip_prefix('#').unwrap_or(v);
+    if h.len() != 6 {
+        return Err(());
+    }
+    u32::from_str_radix(h, 16).map(Some).map_err(|_| ())
+}
+
+fn color_name(c: Option<u32>) -> String {
+    c.map(|c| format!("#{c:06x}")).unwrap_or_default()
+}
+
+/// Every config key, in the order `save` writes them. `set` and `get` must
+/// handle each of these.
+pub const KEYS: &[&str] = &[
+    "font-family",
+    "font-size",
+    "theme",
+    "foreground",
+    "background",
+    "cursor-color",
+    "selection-foreground",
+    "selection-background",
+    "scrollback-limit",
+    "cursor-style",
+    "cursor-style-blink",
+    "window-padding",
+    "window-width",
+    "window-height",
+    "window-decorations",
+    "tab-bar",
+    "copy-on-select",
+    "mouse-hide-while-typing",
+    "mouse-scroll-multiplier",
+    "visual-bell",
+    "bold-is-bright",
+    "window-inherit-working-directory",
+    "clipboard-write",
+    "command",
+    "dropdown-width",
+    "dropdown-height",
+    "dropdown-position",
+    "dropdown-hide-on-focus-loss",
+    "dropdown-always-on-top",
+];
 
 pub fn tab_bar_name(t: TabBar) -> &'static str {
     match t {
@@ -148,6 +247,29 @@ impl Config {
             "window-inherit-working-directory" => self.inherit_cwd = parse_bool(v).ok_or_else(bad)?,
             "clipboard-write" => self.clipboard_write = parse_bool(v).ok_or_else(bad)?,
             "command" => self.command = v.to_string(),
+            "window-width" => self.window_cols = v.parse::<usize>().map_err(|_| bad())?.clamp(10, 1000),
+            "window-height" => self.window_rows = v.parse::<usize>().map_err(|_| bad())?.clamp(2, 500),
+            "window-decorations" => self.decorations = parse_bool(v).ok_or_else(bad)?,
+            "mouse-hide-while-typing" => self.mouse_hide_while_typing = parse_bool(v).ok_or_else(bad)?,
+            "mouse-scroll-multiplier" => {
+                self.scroll_multiplier = v.parse::<f32>().map_err(|_| bad())?.clamp(0.1, 50.0)
+            }
+            "foreground" => self.foreground = parse_color(v).map_err(|_| bad())?,
+            "background" => self.background = parse_color(v).map_err(|_| bad())?,
+            "cursor-color" => self.cursor_color = parse_color(v).map_err(|_| bad())?,
+            "selection-foreground" => self.selection_fg = parse_color(v).map_err(|_| bad())?,
+            "selection-background" => self.selection_bg = parse_color(v).map_err(|_| bad())?,
+            "dropdown-width" => self.dropdown_width = v.parse::<f32>().map_err(|_| bad())?.clamp(10.0, 100.0),
+            "dropdown-height" => self.dropdown_height = v.parse::<f32>().map_err(|_| bad())?.clamp(10.0, 100.0),
+            "dropdown-position" => {
+                self.dropdown_position = match v {
+                    "top" => Edge::Top,
+                    "bottom" => Edge::Bottom,
+                    _ => return Err(bad()),
+                }
+            }
+            "dropdown-hide-on-focus-loss" => self.dropdown_hide_on_focus_loss = parse_bool(v).ok_or_else(bad)?,
+            "dropdown-always-on-top" => self.dropdown_always_on_top = parse_bool(v).ok_or_else(bad)?,
             _ => return Err(format!("unknown key {key:?}")),
         }
         Ok(())
@@ -171,6 +293,21 @@ impl Config {
             "window-inherit-working-directory" => b(self.inherit_cwd),
             "clipboard-write" => b(self.clipboard_write),
             "command" => self.command.clone(),
+            "window-width" => self.window_cols.to_string(),
+            "window-height" => self.window_rows.to_string(),
+            "window-decorations" => b(self.decorations),
+            "mouse-hide-while-typing" => b(self.mouse_hide_while_typing),
+            "mouse-scroll-multiplier" => crate::ui::fmt_num(self.scroll_multiplier as f64),
+            "foreground" => color_name(self.foreground),
+            "background" => color_name(self.background),
+            "cursor-color" => color_name(self.cursor_color),
+            "selection-foreground" => color_name(self.selection_fg),
+            "selection-background" => color_name(self.selection_bg),
+            "dropdown-width" => crate::ui::fmt_num(self.dropdown_width as f64),
+            "dropdown-height" => crate::ui::fmt_num(self.dropdown_height as f64),
+            "dropdown-position" => edge_name(self.dropdown_position).into(),
+            "dropdown-hide-on-focus-loss" => b(self.dropdown_hide_on_focus_loss),
+            "dropdown-always-on-top" => b(self.dropdown_always_on_top),
             _ => String::new(),
         }
     }
@@ -180,39 +317,13 @@ impl Config {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let b = |v: bool| if v { "true" } else { "false" };
-        let text = format!(
+        let mut text = String::from(
             "# rsterm configuration. Written by the settings screen (Ctrl+,);\n\
-             # hand edits are fine and are picked up automatically.\n\
-             font-family = {}\n\
-             font-size = {}\n\
-             theme = {}\n\
-             scrollback-limit = {}\n\
-             cursor-style = {}\n\
-             cursor-style-blink = {}\n\
-             window-padding = {}\n\
-             tab-bar = {}\n\
-             copy-on-select = {}\n\
-             visual-bell = {}\n\
-             bold-is-bright = {}\n\
-             window-inherit-working-directory = {}\n\
-             clipboard-write = {}\n\
-             command = {}\n",
-            self.font_family,
-            self.font_size,
-            self.theme,
-            self.scrollback,
-            cursor_name(self.cursor_style),
-            b(self.cursor_blink),
-            self.padding,
-            tab_bar_name(self.tab_bar),
-            b(self.copy_on_select),
-            b(self.visual_bell),
-            b(self.bold_is_bright),
-            b(self.inherit_cwd),
-            b(self.clipboard_write),
-            self.command,
+             # hand edits are fine and are picked up automatically.\n",
         );
+        for k in KEYS {
+            text.push_str(&format!("{k} = {}\n", self.get(k)));
+        }
         // Write atomically so the watcher never sees a half-written file.
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, text)?;
@@ -418,5 +529,27 @@ mod tests {
         assert_eq!(c.cursor_style, CursorShape::Bar);
         assert_eq!(c.tab_bar, TabBar::Always);
         assert!(!c.copy_on_select);
+        c.set("background", "#102030").unwrap();
+        assert_eq!(c.background, Some(0x102030));
+        c.set("background", "").unwrap();
+        assert_eq!(c.background, None);
+        assert!(c.set("background", "#12").is_err());
+        c.set("dropdown-position", "bottom").unwrap();
+        assert_eq!(c.dropdown_position, Edge::Bottom);
+    }
+
+    /// `save` writes `get` for every key in KEYS; each must parse back.
+    #[test]
+    fn every_key_roundtrips() {
+        let mut c = Config::default();
+        c.foreground = Some(0xabcdef);
+        c.dropdown_position = Edge::Bottom;
+        c.command = "fish".into();
+        let mut d = Config::default();
+        for k in KEYS {
+            let v = c.get(k);
+            d.set(k, &v).unwrap_or_else(|e| panic!("{k}: {e}"));
+        }
+        assert_eq!(c, d);
     }
 }

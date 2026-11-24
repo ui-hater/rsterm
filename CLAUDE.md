@@ -15,11 +15,12 @@ cargo test --release scroll_region    # run a single test by name filter
 cargo clippy --release
 
 ./target/release/rsterm               # run (spawns $SHELL on a pty)
+./target/release/rsterm --dropdown     # quake-style: first call starts it, later calls toggle (also: show|hide)
 ./target/release/rsterm --bench FILE  # headless parser/emulator benchmark, prints MB/s
 RSTERM_DUMP=out.ppm ./target/release/rsterm   # also render every frame offscreen and write it as PPM (debug aid)
 ```
 
-Config lives in `$XDG_CONFIG_HOME/rsterm/config` (Ghostty-style `key = value`, keys defined in `Config::set`/`get`/`save` in config.rs — keep those three in sync). It is hot-reloaded via a polling watcher thread, and the settings screen rewrites the whole file. `RSTERM_FONT` / `RSTERM_FONT_SIZE` override it; `WGPU_BACKEND` overrides the default Vulkan|GL backend set. **When testing, point `XDG_CONFIG_HOME` at a scratch dir** so the settings screen doesn't overwrite the user's real config.
+Config lives in `$XDG_CONFIG_HOME/rsterm/config` (Ghostty-style `key = value`, every key is listed in `config::KEYS`, which `save` iterates; `Config::set`/`get` must handle each one — the `every_key_roundtrips` test enforces this). It is hot-reloaded via a polling watcher thread, and the settings screen rewrites the whole file. `RSTERM_FONT` / `RSTERM_FONT_SIZE` override it; `WGPU_BACKEND` overrides the default Vulkan|GL backend set. **When testing, point `XDG_CONFIG_HOME` at a scratch dir** so the settings screen doesn't overwrite the user's real config.
 
 Testing without a visible screen / keyboard: set `SHELL` to a script that prints test output, use `RSTERM_DUMP` for visuals, and python `gi.repository.Atspi` (installed) to inspect the tree, invoke `click` actions on tabs/menu items, or listen for `object:text-changed:*` / `object:text-caret-moved` events. Debug builds (`cargo build`, `./target/debug/rsterm`) accept `RSTERM_DEBUG_SCRIPT="a:OpenMenu;k:ArrowDown;k:Enter;t:text;w:300"` (a: `Action`, k: named key into the open overlay, t: text, w: wait ms) — this drives the UI where synthetic X key events can't reach the window (e.g. a locked screen). When benchmarking with raw files, use CRLF line endings — the pty converts `\n` to `\r\n`, and bare `\n` input hits the slow wrap path and gives misleading numbers.
 
@@ -33,6 +34,8 @@ Each tab is a `Session` (session.rs): its own pty, `Arc<Shared>` (`Mutex<Term>` 
 - **vt-parser thread**: drains all queued chunks, runs `vte::Parser::advance` into `Term` under one `Mutex<Term>` lock, writes `Term::responses` (DA/DSR replies) back to the pty, then sends `UserEvent::Wakeup` only if `wakeup_pending` wasn't already set (coalesces to ≤1 wakeup per frame).
 - **main thread** (winit `ApplicationHandler<UserEvent>`): on wakeup → `request_redraw` (active tab) or mark tab activity (background tab). Redraw rebuilds the `CellInstance` array only when a hash of (term generation, `ui_gen`, atlas epoch, focus, blink phase, ...) changes. Timers (cursor blink, visual bell, sync-output timeout, a11y throttle) are all folded into one `ControlFlow::WaitUntil` in `about_to_wait` via `next_deadline`.
 - Input: `input::shortcut` maps keys to `ui::Action` (dispatched by `State::run`); otherwise `input::encode` produces xterm bytes. When an overlay is open, keys go to `State::overlay_key(named, text)` instead (decoupled from winit `KeyEvent` so the debug script can drive it).
+
+Dropdown mode (`dropdown.rs`, `State::*_dropdown` in main.rs): `rsterm --dropdown` takes an `flock` on `$XDG_RUNTIME_DIR/rsterm-dropdown<display>.lock` and listens on the matching `.sock`; later invocations forward `toggle`/`show`/`hide` there and exit (the user binds the command to a desktop hotkey — no global key grab). The dropdown forces winit's X11 backend (XWayland under Wayland) because Wayland clients can't unmap or position windows. Hide = `set_visible(false)` plus a synthetic `Focused(false)` to the AccessKit adapter; show = place on monitor, map, then retry `focus_window` from `about_to_wait` until `Focused(true)` (it's a no-op until the WM maps the window). Window focus is what makes Orca announce the window, so never show without focusing. A11y pushes are paused while hidden. Testing it live on the user's display steals their keyboard focus — don't.
 
 Key invariants spanning files:
 

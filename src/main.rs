@@ -2,6 +2,7 @@
 
 mod a11y;
 mod config;
+mod dropdown;
 mod font;
 mod input;
 mod pty;
@@ -10,7 +11,7 @@ mod session;
 mod term;
 mod ui;
 
-use config::{Config, TabBar};
+use config::{Config, Edge, TabBar};
 use render::{CellInstance, Renderer, pack};
 use session::{Session, Spawn};
 use std::sync::Arc;
@@ -28,6 +29,11 @@ const BLINK: Duration = Duration::from_millis(530);
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 const FLASH: Duration = Duration::from_millis(120);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// How long to keep asking the window manager to focus a just-shown dropdown.
+const FOCUS_RETRY: Duration = Duration::from_millis(1000);
+/// Grace period before hide-on-focus-loss acts, so brief focus blips
+/// (a notification, a screen reader popup) don't make the window vanish.
+const HIDE_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 enum UserEvent {
@@ -35,6 +41,7 @@ enum UserEvent {
     Wakeup(u64),
     Exited(u64),
     ConfigChanged,
+    Dropdown(dropdown::Cmd),
     /// Debug builds only: one step of RSTERM_DEBUG_SCRIPT.
     #[cfg(debug_assertions)]
     Debug(String),
@@ -219,6 +226,14 @@ struct State {
     a11y_active: bool,
     a11y_sent: (u64, u64, u64),
     a11y_last: Instant,
+
+    /// Dropdown mode: the window is shown/hidden by `rsterm --dropdown`.
+    dropdown: bool,
+    shown: bool,
+    /// Keep requesting focus until this time (or until we get it).
+    focus_until: Option<Instant>,
+    /// Hide-on-focus-loss deadline.
+    hide_at: Option<Instant>,
 }
 
 fn font_px(pt: f32, scale: f64) -> f32 {
@@ -227,8 +242,12 @@ fn font_px(pt: f32, scale: f64) -> f32 {
 
 fn theme_colors(cfg: &Config) -> (Colors, UiColors) {
     let t = config::theme(&cfg.theme).unwrap_or(&config::THEMES[0]);
-    let c = Colors { palette: config::palette(t), fg: t.fg, bg: t.bg, cursor: t.cursor };
-    (c, UiColors::new(t.fg, t.bg, t.selection_fg, t.selection_bg))
+    let fg = cfg.foreground.unwrap_or(t.fg);
+    let bg = cfg.background.unwrap_or(t.bg);
+    let cursor = cfg.cursor_color.unwrap_or(t.cursor);
+    let c = Colors { palette: config::palette(t), fg, bg, cursor };
+    let (sel_fg, sel_bg) = (cfg.selection_fg.unwrap_or(t.selection_fg), cfg.selection_bg.unwrap_or(t.selection_bg));
+    (c, UiColors::new(fg, bg, sel_fg, sel_bg))
 }
 
 impl State {
@@ -286,10 +305,12 @@ impl State {
     fn reload_font(&mut self) {
         let pt = (self.cfg.font_size + self.zoom).clamp(4.0, 96.0);
         self.glyphs = font::Glyphs::new(&self.cfg.font_family, font_px(pt, self.scale));
-        self.window.set_resize_increments(Some(winit::dpi::PhysicalSize::new(
-            self.glyphs.cell_w,
-            self.glyphs.cell_h,
-        )));
+        if !self.dropdown {
+            self.window.set_resize_increments(Some(winit::dpi::PhysicalSize::new(
+                self.glyphs.cell_w,
+                self.glyphs.cell_h,
+            )));
+        }
         self.apply_size();
     }
 
@@ -381,11 +402,25 @@ impl State {
 
     fn apply_config(&mut self, new: Config, save: bool) {
         let old = std::mem::replace(&mut self.cfg, new);
-        if old.theme != self.cfg.theme {
-            (self.colors, self.ui_colors) = theme_colors(&self.cfg);
+        let (colors, ui_colors) = theme_colors(&self.cfg);
+        if colors != self.colors || ui_colors != self.ui_colors {
+            (self.colors, self.ui_colors) = (colors, ui_colors);
             for s in &self.tabs {
                 s.shared.term.lock().unwrap().set_colors(self.colors);
             }
+        }
+        if self.dropdown {
+            let c = &self.cfg;
+            if (c.dropdown_width, c.dropdown_height, c.dropdown_position, c.dropdown_always_on_top)
+                != (old.dropdown_width, old.dropdown_height, old.dropdown_position, old.dropdown_always_on_top)
+            {
+                self.place_dropdown();
+            }
+            if !c.dropdown_hide_on_focus_loss {
+                self.hide_at = None;
+            }
+        } else if old.decorations != self.cfg.decorations {
+            self.window.set_decorations(self.cfg.decorations);
         }
         if old.scrollback != self.cfg.scrollback {
             for s in &self.tabs {
@@ -704,7 +739,9 @@ impl State {
             }
         }
         self.write(&bytes);
-        self.window.set_cursor_visible(false);
+        if self.cfg.mouse_hide_while_typing {
+            self.window.set_cursor_visible(false);
+        }
     }
 
     /// Keyboard handling while a menu / search bar / settings screen is open.
@@ -781,9 +818,12 @@ impl State {
                             let v = s.editing.take().unwrap();
                             let key = s.items[s.sel].key;
                             let mut cfg = self.cfg.clone();
-                            if cfg.set(key, v.trim()).is_ok() {
-                                self.apply_config(cfg, true);
-                                self.announce("Saved");
+                            match cfg.set(key, v.trim()) {
+                                Ok(()) => {
+                                    self.apply_config(cfg, true);
+                                    self.announce("Saved");
+                                }
+                                Err(e) => self.announce(format!("Not saved: {e}")),
                             }
                         }
                         Some(NamedKey::Backspace) => {
@@ -1270,7 +1310,10 @@ impl State {
     // -- accessibility ----------------------------------------------------------------
 
     fn push_a11y(&mut self) {
-        if !self.a11y_active {
+        // While the dropdown is hidden its tree is frozen: Orca would otherwise
+        // hear text changes from a window the user can't see. The incremental
+        // diff catches up in one update when it's shown again.
+        if !self.a11y_active || (self.dropdown && !self.shown) {
             return;
         }
         let (cols, rows) = self.window_grid();
@@ -1300,6 +1343,7 @@ impl State {
             overlay: &self.overlay,
             cfg: &self.cfg,
             announcement: &self.announcement,
+            dropdown: self.dropdown,
         };
         let update = self.a11y.update(&term, &g, &view);
         self.a11y_sent = (term.generation, self.ui_gen, self.session().id);
@@ -1329,6 +1373,99 @@ impl State {
         }
     }
 
+    // -- dropdown -------------------------------------------------------------------
+
+    /// Size and position the dropdown on the monitor it's on (or the primary).
+    fn place_dropdown(&self) {
+        use winit::dpi::{PhysicalPosition, PhysicalSize};
+        let mon = self.window.current_monitor().or_else(|| self.window.primary_monitor());
+        let Some(mon) = mon else { return };
+        let (mp, ms) = (mon.position(), mon.size());
+        let w = (ms.width as f32 * self.cfg.dropdown_width / 100.0).round() as u32;
+        let h = (ms.height as f32 * self.cfg.dropdown_height / 100.0).round() as u32;
+        let x = mp.x + (ms.width.saturating_sub(w) / 2) as i32;
+        let y = match self.cfg.dropdown_position {
+            Edge::Top => mp.y,
+            Edge::Bottom => mp.y + ms.height.saturating_sub(h) as i32,
+        };
+        let _ = self.window.request_inner_size(PhysicalSize::new(w, h));
+        self.window.set_outer_position(PhysicalPosition::new(x, y));
+        self.window.set_window_level(if self.cfg.dropdown_always_on_top {
+            winit::window::WindowLevel::AlwaysOnTop
+        } else {
+            winit::window::WindowLevel::Normal
+        });
+    }
+
+    fn dropdown_cmd(&mut self, cmd: dropdown::Cmd) {
+        let show = match cmd {
+            dropdown::Cmd::Show => true,
+            dropdown::Cmd::Hide => false,
+            // A shown-but-unfocused dropdown (behind nothing, but focus went
+            // elsewhere) is brought to focus rather than hidden.
+            dropdown::Cmd::Toggle => !(self.shown && self.focused),
+        };
+        if show { self.show_dropdown() } else { self.hide_dropdown() }
+    }
+
+    fn show_dropdown(&mut self) {
+        self.hide_at = None;
+        if !self.shown {
+            self.shown = true;
+            self.place_dropdown();
+            self.window.set_visible(true);
+            // Re-place after mapping: some WMs ignore geometry of unmapped windows.
+            self.place_dropdown();
+            self.last_frame = 0;
+            self.touch_ui();
+        }
+        // focus_window is a no-op until the WM has mapped the window, so keep
+        // asking (from about_to_wait) until Focused(true) arrives. Focus is
+        // what makes Orca announce the window and start tracking the terminal.
+        self.window.focus_window();
+        self.focus_until = Some(Instant::now() + FOCUS_RETRY);
+    }
+
+    fn hide_dropdown(&mut self) {
+        self.hide_at = None;
+        self.focus_until = None;
+        if !self.shown {
+            return;
+        }
+        self.shown = false;
+        self.overlay = Overlay::None;
+        self.selecting = false;
+        self.mouse_buttons = 0;
+        self.window.set_visible(false);
+        // Unmapping doesn't always deliver FocusOut; tell AccessKit directly so
+        // the AT-SPI window is deactivated and Orca stops treating it as active.
+        if self.focused {
+            self.focused = false;
+            self.adapter.process_event(&self.window, &WindowEvent::Focused(false));
+        }
+    }
+
+    /// Dropdown timers: focus retries and hide-on-focus-loss.
+    fn dropdown_tick(&mut self, now: Instant) {
+        if let Some(until) = self.focus_until {
+            if self.focused || !self.shown {
+                self.focus_until = None;
+            } else if now >= until {
+                self.focus_until = None;
+                // The WM refused focus; at least flag the window.
+                self.window.request_user_attention(Some(winit::window::UserAttentionType::Critical));
+            } else {
+                self.window.focus_window();
+            }
+        }
+        if self.hide_at.is_some_and(|t| now >= t) {
+            self.hide_at = None;
+            if !self.focused {
+                self.hide_dropdown();
+            }
+        }
+    }
+
     /// Earliest time something needs to happen without input.
     fn next_deadline(&self) -> Option<Instant> {
         let mut d: Vec<Instant> = Vec::new();
@@ -1338,6 +1475,12 @@ impl State {
         }
         if let Some(t) = self.flash_until {
             d.push(t);
+        }
+        if let Some(t) = self.hide_at {
+            d.push(t);
+        }
+        if self.focus_until.is_some() {
+            d.push(Instant::now() + Duration::from_millis(50));
         }
         if let Some(t) = self.session().shared.term.lock().unwrap().sync_since {
             d.push(t + SYNC_TIMEOUT);
@@ -1413,6 +1556,10 @@ impl State {
                     self.overlay_key(None, Some(arg));
                 }
             }
+            "d" => match dropdown::Cmd::parse(arg) {
+                Some(c) => self.dropdown_cmd(c),
+                None => eprintln!("debug: bad dropdown command {arg}"),
+            },
             _ => eprintln!("debug: bad step {step}"),
         }
     }
@@ -1434,23 +1581,39 @@ fn open_url(url: &str) {
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     state: Option<State>,
+    dropdown: bool,
 }
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::platform::x11::{WindowAttributesExtX11, WindowType};
         let (cfg, errors) = Config::load();
-        let attrs = Window::default_attributes()
-            .with_title("rsterm")
+        let dropdown = self.dropdown;
+        let mut attrs = Window::default_attributes()
+            .with_title(if dropdown { "rsterm dropdown" } else { "rsterm" })
             .with_visible(false)
-            .with_inner_size(winit::dpi::LogicalSize::new(900.0, 560.0));
+            .with_decorations(cfg.decorations && !dropdown)
+            // WM_CLASS / app_id, so window rules can target the dropdown.
+            .with_name("rsterm", if dropdown { "rsterm-dropdown" } else { "rsterm" });
+        if dropdown {
+            // Utility windows stay out of the taskbar and Alt+Tab but still
+            // take keyboard focus (unlike Dock windows).
+            attrs = attrs.with_x11_window_type(vec![WindowType::Utility]);
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         // The AccessKit adapter must exist before the window is first shown.
         let adapter = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
-        window.set_visible(true);
 
         let scale = window.scale_factor();
         let glyphs = font::Glyphs::new(&cfg.font_family, font_px(cfg.font_size, scale));
-        window.set_resize_increments(Some(winit::dpi::PhysicalSize::new(glyphs.cell_w, glyphs.cell_h)));
+        let pad = (cfg.padding * scale as f32).round();
+        if !dropdown {
+            window.set_resize_increments(Some(winit::dpi::PhysicalSize::new(glyphs.cell_w, glyphs.cell_h)));
+            let w = cfg.window_cols as f32 * glyphs.cell_w as f32 + 2.0 * pad;
+            let h = cfg.window_rows as f32 * glyphs.cell_h as f32 + 2.0 * pad;
+            let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(w as u32, h as u32));
+            window.set_visible(true);
+        }
         let renderer = Renderer::new(window.clone());
         let (colors, ui_colors) = theme_colors(&cfg);
 
@@ -1467,7 +1630,7 @@ impl App {
             glyphs,
             adapter,
             proxy: self.proxy.clone(),
-            pad: (cfg.padding * scale as f32).round(),
+            pad,
             cfg,
             colors,
             ui_colors,
@@ -1499,9 +1662,17 @@ impl App {
             a11y_active: false,
             a11y_sent: (0, 0, u64::MAX),
             a11y_last: Instant::now(),
+            dropdown,
+            shown: false,
+            focus_until: None,
+            hide_at: None,
         };
         let s = st.spawn_session(None).expect("spawn shell");
         st.tabs.push(s);
+        if dropdown {
+            // The first `rsterm --dropdown` is itself a hotkey press: appear.
+            st.show_dropdown();
+        }
         if let Some(e) = errors.first() {
             st.announce(format!("Config error, {e}"));
         }
@@ -1526,6 +1697,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ConfigChanged => st.reload_config(false),
+            UserEvent::Dropdown(cmd) => st.dropdown_cmd(cmd),
             #[cfg(debug_assertions)]
             UserEvent::Debug(step) => st.debug_step(&step),
             UserEvent::AccessKit(ev) => match ev.window_event {
@@ -1557,6 +1729,14 @@ impl ApplicationHandler<UserEvent> for App {
                 st.a11y.reset();
             }
             WindowEvent::Focused(f) => {
+                if st.dropdown {
+                    if f {
+                        st.focus_until = None;
+                        st.hide_at = None;
+                    } else if st.shown && st.cfg.dropdown_hide_on_focus_loss {
+                        st.hide_at = Some(Instant::now() + HIDE_GRACE);
+                    }
+                }
                 st.focused = f;
                 st.blink_epoch = Instant::now();
                 let report = st.session().shared.term.lock().unwrap().focus_events;
@@ -1578,7 +1758,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => st.on_mouse_button(state, button),
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
+                    MouseScrollDelta::LineDelta(_, y) => (y * st.cfg.scroll_multiplier).round() as isize,
                     MouseScrollDelta::PixelDelta(p) => {
                         st.scroll_accum += p.y / st.glyphs.cell_h as f64;
                         let l = st.scroll_accum.trunc();
@@ -1600,6 +1780,9 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let now = Instant::now();
+        if st.dropdown {
+            st.dropdown_tick(now);
+        }
         let mut wait = st.next_deadline();
         if wait.is_some_and(|t| t <= now) {
             if st.flash_until.is_some_and(|t| t <= now) {
@@ -1609,7 +1792,7 @@ impl ApplicationHandler<UserEvent> for App {
             wait = st.next_deadline().filter(|&t| t > now);
         }
 
-        if st.a11y_active {
+        if st.a11y_active && (st.shown || !st.dropdown) {
             let generation = st.session().shared.term.lock().unwrap().generation;
             let (g, u, tab) = st.a11y_sent;
             let id = st.session().id;
@@ -1653,8 +1836,48 @@ fn main() {
         );
         return;
     }
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    if args.get(1).is_some_and(|a| a == "--help" || a == "-h") {
+        println!(
+            "usage: rsterm [--dropdown [toggle|show|hide]] [--bench FILE]\n\n  \
+             --dropdown   quake-style terminal: the first call starts it, later calls\n               \
+             toggle/show/hide it. Bind `rsterm --dropdown` to a global hotkey."
+        );
+        return;
+    }
+    let mut instance = None;
+    let dropdown = args.get(1).is_some_and(|a| a == "--dropdown");
+    if dropdown {
+        let cmd = match args.get(2) {
+            None => dropdown::Cmd::Toggle,
+            Some(a) => dropdown::Cmd::parse(a).unwrap_or_else(|| {
+                eprintln!("rsterm: unknown dropdown command {a:?} (expected toggle, show or hide)");
+                std::process::exit(2)
+            }),
+        };
+        match dropdown::claim(cmd) {
+            Ok(dropdown::Role::Forwarded) => return,
+            Ok(dropdown::Role::Primary(i)) => instance = Some(i),
+            Err(e) => {
+                eprintln!("rsterm: could not reach or start the dropdown instance: {e}");
+                std::process::exit(1)
+            }
+        }
+    }
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    if dropdown && std::env::var_os("DISPLAY").is_some() {
+        // Wayland clients can neither hide (unmap) nor position their own
+        // windows, so the dropdown runs through X11/XWayland where both work.
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+    }
+    let event_loop = builder.build().expect("event loop");
     let proxy = event_loop.create_proxy();
-    let mut app = App { proxy, state: None };
+    if let Some(i) = instance {
+        let p = proxy.clone();
+        i.serve(move |cmd| {
+            let _ = p.send_event(UserEvent::Dropdown(cmd));
+        });
+    }
+    let mut app = App { proxy, state: None, dropdown };
     event_loop.run_app(&mut app).expect("run");
 }

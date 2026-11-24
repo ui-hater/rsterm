@@ -72,6 +72,8 @@ pub struct UiView<'a> {
     pub overlay: &'a Overlay,
     pub cfg: &'a Config,
     pub announcement: &'a str,
+    /// Running as the dropdown (quake-style) window.
+    pub dropdown: bool,
 }
 
 #[derive(Default)]
@@ -318,6 +320,9 @@ impl A11y {
                             };
                             let b = g.cells((rect.0 + 1, rect.1 + 2, rect.2 - 2, 1));
                             nodes.push(text_field(&mut n, SETTING_TEXT, &v, b, g.cell_w));
+                            if !it.empty.is_empty() {
+                                n.set_placeholder(it.empty.trim_matches(['(', ')']).to_string());
+                            }
                             n.set_value(v);
                             n
                         }
@@ -357,7 +362,9 @@ impl A11y {
         nodes.push((STATUS, status));
 
         let mut root = Node::new(Role::Window);
-        root.set_label(ui.title.to_string());
+        // The dropdown gets a distinct name so Orca's "window activated"
+        // announcement says which kind of terminal just appeared.
+        root.set_label(if ui.dropdown { format!("Dropdown terminal: {}", ui.title) } else { ui.title.to_string() });
         root.set_children(root_children);
         nodes.push((ROOT, root));
 

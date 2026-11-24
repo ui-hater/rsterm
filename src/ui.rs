@@ -111,6 +111,8 @@ pub struct Setting {
     pub key: &'static str,
     pub label: &'static str,
     pub kind: Kind,
+    /// Shown (and spoken) in place of an empty text value.
+    pub empty: &'static str,
 }
 
 pub struct SettingsState {
@@ -124,21 +126,39 @@ pub struct SettingsState {
 impl SettingsState {
     pub fn new() -> SettingsState {
         let s = |v: &[&str]| Kind::Choice(v.iter().map(|s| s.to_string()).collect());
+        let num = |min: f64, max: f64, step: f64| Kind::Number { min, max, step };
+        let set = |key, label, kind| Setting { key, label, kind, empty: "" };
+        let color = |key, label| Setting { key, label, kind: Kind::Text, empty: "(theme)" };
         let items = vec![
-            Setting { key: "theme", label: "Theme", kind: s(&config::THEMES.iter().map(|t| t.name).collect::<Vec<_>>()) },
-            Setting { key: "font-family", label: "Font family", kind: Kind::Choice(config::monospace_families()) },
-            Setting { key: "font-size", label: "Font size", kind: Kind::Number { min: 4.0, max: 96.0, step: 1.0 } },
-            Setting { key: "cursor-style", label: "Cursor style", kind: s(&["block", "underline", "bar"]) },
-            Setting { key: "cursor-style-blink", label: "Blinking cursor", kind: Kind::Bool },
-            Setting { key: "scrollback-limit", label: "Scrollback lines", kind: Kind::Number { min: 0.0, max: 1_000_000.0, step: 1000.0 } },
-            Setting { key: "window-padding", label: "Window padding", kind: Kind::Number { min: 0.0, max: 100.0, step: 1.0 } },
-            Setting { key: "tab-bar", label: "Show tab bar", kind: s(&["auto", "always", "never"]) },
-            Setting { key: "copy-on-select", label: "Copy on select", kind: Kind::Bool },
-            Setting { key: "visual-bell", label: "Visual bell", kind: Kind::Bool },
-            Setting { key: "bold-is-bright", label: "Bold text uses bright colors", kind: Kind::Bool },
-            Setting { key: "window-inherit-working-directory", label: "New tabs open in current directory", kind: Kind::Bool },
-            Setting { key: "clipboard-write", label: "Allow programs to set clipboard", kind: Kind::Bool },
-            Setting { key: "command", label: "Command (empty = login shell)", kind: Kind::Text },
+            set("theme", "Theme", s(&config::THEMES.iter().map(|t| t.name).collect::<Vec<_>>())),
+            set("font-family", "Font family", Kind::Choice(config::monospace_families())),
+            set("font-size", "Font size", num(4.0, 96.0, 1.0)),
+            color("foreground", "Text color (#rrggbb)"),
+            color("background", "Background color (#rrggbb)"),
+            color("cursor-color", "Cursor color (#rrggbb)"),
+            color("selection-foreground", "Selected text color (#rrggbb)"),
+            color("selection-background", "Selection background (#rrggbb)"),
+            set("cursor-style", "Cursor style", s(&["block", "underline", "bar"])),
+            set("cursor-style-blink", "Blinking cursor", Kind::Bool),
+            set("scrollback-limit", "Scrollback lines", num(0.0, 1_000_000.0, 1000.0)),
+            set("window-padding", "Window padding", num(0.0, 100.0, 1.0)),
+            set("window-width", "New window width (columns)", num(10.0, 1000.0, 1.0)),
+            set("window-height", "New window height (rows)", num(2.0, 500.0, 1.0)),
+            set("window-decorations", "Window title bar and border", Kind::Bool),
+            set("tab-bar", "Show tab bar", s(&["auto", "always", "never"])),
+            set("copy-on-select", "Copy on select", Kind::Bool),
+            set("mouse-hide-while-typing", "Hide mouse pointer while typing", Kind::Bool),
+            set("mouse-scroll-multiplier", "Lines per mouse wheel step", num(1.0, 50.0, 1.0)),
+            set("visual-bell", "Visual bell", Kind::Bool),
+            set("bold-is-bright", "Bold text uses bright colors", Kind::Bool),
+            set("window-inherit-working-directory", "New tabs open in current directory", Kind::Bool),
+            set("clipboard-write", "Allow programs to set clipboard", Kind::Bool),
+            Setting { key: "command", label: "Command", kind: Kind::Text, empty: "(login shell)" },
+            set("dropdown-width", "Dropdown width (% of screen)", num(10.0, 100.0, 5.0)),
+            set("dropdown-height", "Dropdown height (% of screen)", num(10.0, 100.0, 5.0)),
+            set("dropdown-position", "Dropdown position", s(&["top", "bottom"])),
+            set("dropdown-hide-on-focus-loss", "Hide dropdown when it loses focus", Kind::Bool),
+            set("dropdown-always-on-top", "Dropdown stays on top", Kind::Bool),
         ];
         SettingsState { sel: 0, items, editing: None, scroll: 0 }
     }
@@ -183,7 +203,7 @@ pub enum Overlay {
 // Colors
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct UiColors {
     pub fg: u32,
     pub panel: u32,
@@ -390,7 +410,7 @@ impl Painter<'_> {
                 (Kind::Bool, _) => (if cfg.get(it.key) == "true" { "[x] on" } else { "[ ] off" }).to_string(),
                 (Kind::Text, _) => {
                     let v = cfg.get(it.key);
-                    if v.is_empty() { "(login shell)".into() } else { v }
+                    if v.is_empty() { it.empty.into() } else { v }
                 }
                 _ => format!("‹ {} ›", cfg.get(it.key)),
             };
