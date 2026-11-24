@@ -16,8 +16,17 @@ fn winsize(cols: u16, rows: u16, cw: u16, ch: u16) -> libc::winsize {
 }
 
 impl Pty {
-    /// Spawn `command` (run via the shell's `-c`) or, if empty, the login shell.
-    pub fn spawn(cols: u16, rows: u16, cw: u16, ch: u16, command: &str, cwd: Option<&str>) -> io::Result<Pty> {
+    /// Spawn `command` (run via the shell's `-c`) or, if empty, the login
+    /// shell (with shell integration loaded if `integration`).
+    pub fn spawn(
+        cols: u16,
+        rows: u16,
+        cw: u16,
+        ch: u16,
+        command: &str,
+        cwd: Option<&str>,
+        integration: bool,
+    ) -> io::Result<Pty> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
         let ws = winsize(cols, rows, cw, ch);
@@ -50,6 +59,8 @@ impl Pty {
         let mut cmd = Command::new(&shell);
         if !command.trim().is_empty() {
             cmd.arg("-c").arg(command);
+        } else if integration {
+            crate::shell_integration::apply(&mut cmd, &shell);
         }
         if let Some(dir) = cwd.filter(|d| std::path::Path::new(d).is_dir()) {
             cmd.current_dir(dir);

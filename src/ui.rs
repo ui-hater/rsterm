@@ -25,6 +25,8 @@ pub enum Action {
     Settings,
     ReloadConfig,
     ClearScrollback,
+    PrevPrompt,
+    NextPrompt,
     OpenMenu,
     Quit,
 }
@@ -52,6 +54,8 @@ pub const MENU: &[MenuItem] = &[
     item("Select All", "Ctrl+Shift+A", Action::SelectAll),
     item("Find…", "Ctrl+Shift+F", Action::Find),
     item("Clear Scrollback", "Ctrl+Shift+K", Action::ClearScrollback),
+    item("Previous Prompt", "Ctrl+Shift+PageUp", Action::PrevPrompt),
+    item("Next Prompt", "Ctrl+Shift+PageDown", Action::NextPrompt),
     SEP,
     item("Zoom In", "Ctrl+Shift+=", Action::ZoomIn),
     item("Zoom Out", "Ctrl+Shift+-", Action::ZoomOut),
@@ -166,6 +170,9 @@ impl SettingsState {
                 empty: "(none)",
             },
             set("dropdown-autostart", "Start dropdown hidden at login", Kind::Bool),
+            set("dropdown-animation-duration", "Dropdown slide duration (seconds)", num(0.0, 2.0, 0.05)),
+            set("desktop-notifications", "Show notifications from programs", Kind::Bool),
+            set("shell-integration", "Shell integration (zsh, bash)", s(&["detect", "none"])),
         ];
         SettingsState { sel: 0, items, editing: None, scroll: 0 }
     }
@@ -178,7 +185,8 @@ impl SettingsState {
             Kind::Bool => (if cur == "true" { "false" } else { "true" }).to_string(),
             Kind::Number { min, max, step } => {
                 let v: f64 = cur.parse().unwrap_or(*min);
-                fmt_num((v + step * dir as f64).clamp(*min, *max))
+                // Round so float steps like 0.05 don't accumulate noise.
+                fmt_num(((v + step * dir as f64).clamp(*min, *max) * 1000.0).round() / 1000.0)
             }
             Kind::Choice(opts) => {
                 if opts.is_empty() {

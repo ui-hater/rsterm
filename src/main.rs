@@ -9,6 +9,7 @@ mod input;
 mod pty;
 mod render;
 mod session;
+mod shell_integration;
 mod term;
 mod ui;
 
@@ -239,6 +240,35 @@ struct State {
     hide_at: Option<Instant>,
     /// Sends a changed `dropdown-hotkey` to the hotkey thread.
     hotkey_tx: Option<std::sync::mpsc::Sender<String>>,
+    /// How far the dropdown is slid in: 0 = off screen, 1 = in place.
+    slide_pos: f32,
+    /// The slide animation in progress, if any.
+    slide: Option<Slide>,
+    /// Monitor the dropdown belongs to. Remembered because while slid out
+    /// the window is off screen (or over a neighbouring monitor).
+    monitor: Option<winit::monitor::MonitorHandle>,
+}
+
+#[derive(Clone, Copy)]
+struct Slide {
+    from: f32,
+    to: f32,
+    start: Instant,
+    dur: Duration,
+}
+
+impl Slide {
+    /// Current position and whether the slide has finished.
+    fn at(&self, now: Instant) -> (f32, bool) {
+        let t = if self.dur.is_zero() {
+            1.0
+        } else {
+            (now.saturating_duration_since(self.start).as_secs_f32() / self.dur.as_secs_f32()).min(1.0)
+        };
+        // Ease out (cubic): fast start, gentle stop.
+        let e = 1.0 - (1.0 - t).powi(3);
+        (self.from + (self.to - self.from) * e, t >= 1.0)
+    }
 }
 
 fn font_px(pt: f32, scale: f64) -> f32 {
@@ -341,6 +371,7 @@ impl State {
                 cell_h: self.glyphs.cell_h,
                 command: &self.cfg.command,
                 cwd: cwd.as_deref(),
+                shell_integration: self.cfg.shell_integration,
                 term,
             },
             move |id| {
@@ -429,11 +460,12 @@ impl State {
         }
         if self.dropdown {
             let c = &self.cfg;
-            if (c.dropdown_width, c.dropdown_height, c.dropdown_position, c.dropdown_always_on_top)
-                != (old.dropdown_width, old.dropdown_height, old.dropdown_position, old.dropdown_always_on_top)
-            {
+            let moved = (c.dropdown_width, c.dropdown_height, c.dropdown_position, c.dropdown_always_on_top)
+                != (old.dropdown_width, old.dropdown_height, old.dropdown_position, old.dropdown_always_on_top);
+            if moved {
                 self.place_dropdown();
             }
+            let c = &self.cfg;
             if !c.dropdown_hide_on_focus_loss {
                 self.hide_at = None;
             }
@@ -528,6 +560,17 @@ impl State {
                 p.advance(&mut *t, b"\x1b[3J");
                 drop(t);
                 self.announce("Scrollback cleared");
+            }
+            Action::PrevPrompt | Action::NextPrompt => {
+                let dir = if a == Action::PrevPrompt { -1 } else { 1 };
+                let r = self.session().shared.term.lock().unwrap().jump_to_prompt(dir);
+                self.window.request_redraw();
+                self.announce(match r {
+                    Some(text) if text.is_empty() => "Bottom".to_string(),
+                    Some(text) => text,
+                    None if dir < 0 => "No previous prompt".to_string(),
+                    None => "No next prompt".to_string(),
+                });
             }
             Action::ZoomIn | Action::ZoomOut | Action::ZoomReset => {
                 self.zoom = match a {
@@ -1188,11 +1231,16 @@ impl State {
         let Some(i) = self.tabs.iter().position(|s| s.id == id) else { return };
         let shared = self.tabs[i].shared.clone();
         shared.wakeup_pending.store(false, std::sync::atomic::Ordering::Release);
-        let (title, bell, clip) = {
+        let (title, bell, clip, notes) = {
             let mut t = shared.term.lock().unwrap();
             let title = std::mem::take(&mut t.title_changed).then(|| t.title.clone());
-            (title, std::mem::take(&mut t.bell), t.clipboard_request.take())
+            (title, std::mem::take(&mut t.bell), t.clipboard_request.take(), std::mem::take(&mut t.notifications))
         };
+        if self.cfg.desktop_notifications {
+            for (t, body) in notes {
+                self.notify(i, t, body);
+            }
+        }
         if let Some(text) = clip.filter(|_| self.cfg.clipboard_write) {
             self.set_clipboard(text, false);
         }
@@ -1225,6 +1273,33 @@ impl State {
                 self.touch_ui();
             }
         }
+    }
+
+    /// Show an OSC 9 / 777 notification from tab `i`. While the user is
+    /// looking at that tab it is announced (spoken, not a popup); otherwise it
+    /// becomes a desktop notification, which screen readers also read.
+    fn notify(&mut self, i: usize, title: String, body: String) {
+        let looking = i == self.active && self.focused && (self.shown || !self.dropdown);
+        if looking {
+            let msg = match (title.is_empty(), body.is_empty()) {
+                (true, _) => body,
+                (false, true) => title,
+                (false, false) => format!("{title}: {body}"),
+            };
+            self.announce(msg);
+            return;
+        }
+        let summary = if title.is_empty() { self.tabs[i].title() } else { title };
+        let summary = if summary.is_empty() { "rsterm".to_string() } else { summary };
+        let _ = std::process::Command::new("notify-send")
+            .args(["--app-name=rsterm", "--icon=utilities-terminal", "--"])
+            .arg(summary)
+            .arg(body)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|mut c| std::thread::spawn(move || c.wait()));
     }
 
     // -- frame ----------------------------------------------------------------------
@@ -1403,26 +1478,45 @@ impl State {
 
     // -- dropdown -------------------------------------------------------------------
 
-    /// Size and position the dropdown on the monitor it's on (or the primary).
-    fn place_dropdown(&self) {
-        use winit::dpi::{PhysicalPosition, PhysicalSize};
-        let mon = self.window.current_monitor().or_else(|| self.window.primary_monitor());
-        let Some(mon) = mon else { return };
+    /// Geometry on the dropdown's monitor: (x, shown y, hidden y, w, h).
+    fn dropdown_geometry(&mut self) -> Option<(i32, i32, i32, u32, u32)> {
+        let valid = |m: &winit::monitor::MonitorHandle| m.size().width > 0;
+        if !self.monitor.as_ref().is_some_and(valid) {
+            self.monitor = self.window.current_monitor().filter(valid).or_else(|| self.window.primary_monitor());
+        }
+        let mon = self.monitor.as_ref()?;
         let (mp, ms) = (mon.position(), mon.size());
         let w = (ms.width as f32 * self.cfg.dropdown_width / 100.0).round() as u32;
         let h = (ms.height as f32 * self.cfg.dropdown_height / 100.0).round() as u32;
         let x = mp.x + (ms.width.saturating_sub(w) / 2) as i32;
-        let y = match self.cfg.dropdown_position {
-            Edge::Top => mp.y,
-            Edge::Bottom => mp.y + ms.height.saturating_sub(h) as i32,
-        };
-        let _ = self.window.request_inner_size(PhysicalSize::new(w, h));
-        self.window.set_outer_position(PhysicalPosition::new(x, y));
+        Some(match self.cfg.dropdown_position {
+            Edge::Top => (x, mp.y, mp.y - h as i32, w, h),
+            Edge::Bottom => (x, mp.y + ms.height.saturating_sub(h) as i32, mp.y + ms.height as i32, w, h),
+        })
+    }
+
+    /// Size and position the dropdown on its monitor.
+    fn place_dropdown(&mut self) {
+        let Some((_, _, _, w, h)) = self.dropdown_geometry() else { return };
+        let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
         self.window.set_window_level(if self.cfg.dropdown_always_on_top {
             winit::window::WindowLevel::AlwaysOnTop
         } else {
             winit::window::WindowLevel::Normal
         });
+        self.move_dropdown();
+    }
+
+    /// Move the dropdown to where `slide_pos` puts it.
+    fn move_dropdown(&mut self) {
+        let Some((x, shown, hidden, _, _)) = self.dropdown_geometry() else { return };
+        let y = hidden + ((shown - hidden) as f32 * self.slide_pos).round() as i32;
+        self.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+    }
+
+    /// Shown, and not on its way out.
+    fn dropdown_visible(&self) -> bool {
+        self.shown && !self.slide.is_some_and(|s| s.to == 0.0)
     }
 
     fn dropdown_cmd(&mut self, cmd: dropdown::Cmd) {
@@ -1431,15 +1525,34 @@ impl State {
             dropdown::Cmd::Hide => false,
             // A shown-but-unfocused dropdown (behind nothing, but focus went
             // elsewhere) is brought to focus rather than hidden.
-            dropdown::Cmd::Toggle => !(self.shown && self.focused),
+            dropdown::Cmd::Toggle => !(self.dropdown_visible() && self.focused),
         };
         if show { self.show_dropdown() } else { self.hide_dropdown() }
+    }
+
+    /// Animate `slide_pos` towards `to` (0 or 1), or jump there if
+    /// animations are off.
+    fn start_slide(&mut self, to: f32, now: Instant) {
+        let secs = self.cfg.dropdown_animation * (to - self.slide_pos).abs();
+        if secs <= 0.0 {
+            self.slide = None;
+            self.slide_pos = to;
+            self.move_dropdown();
+            if to == 0.0 {
+                self.finish_hide();
+            }
+            return;
+        }
+        self.slide = Some(Slide { from: self.slide_pos, to, start: now, dur: Duration::from_secs_f32(secs) });
     }
 
     fn show_dropdown(&mut self) {
         self.hide_at = None;
         if !self.shown {
             self.shown = true;
+            // Pick the monitor afresh each time it appears.
+            self.monitor = None;
+            self.slide_pos = if self.cfg.dropdown_animation > 0.0 { 0.0 } else { 1.0 };
             self.place_dropdown();
             self.window.set_visible(true);
             // Re-place after mapping: some WMs ignore geometry of unmapped windows.
@@ -1447,6 +1560,7 @@ impl State {
             self.last_frame = 0;
             self.touch_ui();
         }
+        self.start_slide(1.0, Instant::now());
         // focus_window is a no-op until the WM has mapped the window, so keep
         // asking (from about_to_wait) until Focused(true) arrives. Focus is
         // what makes Orca announce the window and start tracking the terminal.
@@ -1454,16 +1568,24 @@ impl State {
         self.focus_until = Some(Instant::now() + FOCUS_RETRY);
     }
 
+    /// Start hiding: slide out, then unmap (`finish_hide`).
     fn hide_dropdown(&mut self) {
         self.hide_at = None;
         self.focus_until = None;
+        if !self.dropdown_visible() {
+            return;
+        }
+        self.overlay = Overlay::None;
+        self.selecting = false;
+        self.mouse_buttons = 0;
+        self.start_slide(0.0, Instant::now());
+    }
+
+    fn finish_hide(&mut self) {
         if !self.shown {
             return;
         }
         self.shown = false;
-        self.overlay = Overlay::None;
-        self.selecting = false;
-        self.mouse_buttons = 0;
         self.window.set_visible(false);
         // Unmapping doesn't always deliver FocusOut; tell AccessKit directly so
         // the AT-SPI window is deactivated and Orca stops treating it as active.
@@ -1473,8 +1595,19 @@ impl State {
         }
     }
 
-    /// Dropdown timers: focus retries and hide-on-focus-loss.
+    /// Dropdown timers: slide animation, focus retries and hide-on-focus-loss.
     fn dropdown_tick(&mut self, now: Instant) {
+        if let Some(sl) = self.slide {
+            let (pos, done) = sl.at(now);
+            self.slide_pos = pos;
+            self.move_dropdown();
+            if done {
+                self.slide = None;
+                if sl.to == 0.0 {
+                    self.finish_hide();
+                }
+            }
+        }
         if let Some(until) = self.focus_until {
             if self.focused || !self.shown {
                 self.focus_until = None;
@@ -1509,6 +1642,10 @@ impl State {
         }
         if self.focus_until.is_some() {
             d.push(Instant::now() + Duration::from_millis(50));
+        }
+        if self.slide.is_some() {
+            // ~120 Hz; the WM/compositor shows it at its own rate.
+            d.push(Instant::now() + Duration::from_millis(8));
         }
         if let Some(t) = self.session().shared.term.lock().unwrap().sync_since {
             d.push(t + SYNC_TIMEOUT);
@@ -1553,6 +1690,8 @@ impl State {
                     "ZoomOut" => Action::ZoomOut,
                     "Settings" => Action::Settings,
                     "ReloadConfig" => Action::ReloadConfig,
+                    "PrevPrompt" => Action::PrevPrompt,
+                    "NextPrompt" => Action::NextPrompt,
                     "OpenMenu" => Action::OpenMenu,
                     "Quit" => Action::Quit,
                     _ => return eprintln!("debug: unknown action {arg}"),
@@ -1698,6 +1837,9 @@ impl App {
             focus_until: None,
             hide_at: None,
             hotkey_tx: None,
+            slide_pos: 1.0,
+            slide: None,
+            monitor: None,
         };
         let s = st.spawn_session(None).expect("spawn shell");
         st.tabs.push(s);

@@ -58,6 +58,12 @@ pub struct Config {
     pub dropdown_hotkey: String,
     /// Start the dropdown hidden at login (XDG autostart entry).
     pub dropdown_autostart: bool,
+    /// Seconds the dropdown takes to slide in or out (0 = no animation).
+    pub dropdown_animation: f32,
+    /// Show OSC 9 / OSC 777 notifications from programs.
+    pub desktop_notifications: bool,
+    /// Inject prompt marks (OSC 133) into zsh and bash.
+    pub shell_integration: bool,
 }
 
 impl Default for Config {
@@ -96,6 +102,9 @@ impl Default for Config {
             dropdown_always_on_top: true,
             dropdown_hotkey: "F12".into(),
             dropdown_autostart: false,
+            dropdown_animation: 0.2,
+            desktop_notifications: true,
+            shell_integration: true,
         }
     }
 }
@@ -181,6 +190,9 @@ pub const KEYS: &[&str] = &[
     "dropdown-always-on-top",
     "dropdown-hotkey",
     "dropdown-autostart",
+    "dropdown-animation-duration",
+    "desktop-notifications",
+    "shell-integration",
 ];
 
 pub fn tab_bar_name(t: TabBar) -> &'static str {
@@ -297,6 +309,17 @@ impl Config {
                 self.dropdown_hotkey = v.to_string();
             }
             "dropdown-autostart" => self.dropdown_autostart = parse_bool(v).ok_or_else(bad)?,
+            "dropdown-animation-duration" => {
+                self.dropdown_animation = v.parse::<f32>().map_err(|_| bad())?.clamp(0.0, 2.0)
+            }
+            "desktop-notifications" => self.desktop_notifications = parse_bool(v).ok_or_else(bad)?,
+            "shell-integration" => {
+                self.shell_integration = match v {
+                    "detect" => true,
+                    "none" => false,
+                    _ => return Err(bad()),
+                }
+            }
             _ => return Err(format!("unknown key {key:?}")),
         }
         Ok(())
@@ -337,6 +360,9 @@ impl Config {
             "dropdown-always-on-top" => b(self.dropdown_always_on_top),
             "dropdown-hotkey" => self.dropdown_hotkey.clone(),
             "dropdown-autostart" => b(self.dropdown_autostart),
+            "dropdown-animation-duration" => crate::ui::fmt_num(self.dropdown_animation as f64),
+            "desktop-notifications" => b(self.desktop_notifications),
+            "shell-integration" => (if self.shell_integration { "detect" } else { "none" }).into(),
             _ => String::new(),
         }
     }
@@ -576,6 +602,9 @@ mod tests {
         c.command = "fish".into();
         c.dropdown_hotkey = "ctrl+grave".into();
         c.dropdown_autostart = true;
+        c.dropdown_animation = 0.35;
+        c.desktop_notifications = false;
+        c.shell_integration = false;
         let mut d = Config::default();
         for k in KEYS {
             let v = c.get(k);

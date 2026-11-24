@@ -67,6 +67,8 @@ pub struct Row {
     pub cells: Vec<Cell>,
     /// The line continues on the next row (soft wrap).
     pub wrapped: bool,
+    /// A shell prompt starts on this row (OSC 133;A).
+    pub prompt: bool,
     /// Cells at or beyond this column are known to be default blanks, so a
     /// reset only has to clear `[..occ]`. This makes scrolling O(line length).
     occ: usize,
@@ -75,7 +77,7 @@ pub struct Row {
 impl Row {
     fn new(cols: usize, bg: Color) -> Row {
         let occ = if bg == Color::DEFAULT { 0 } else { cols };
-        Row { cells: vec![Cell::blank(bg); cols], wrapped: false, occ }
+        Row { cells: vec![Cell::blank(bg); cols], wrapped: false, prompt: false, occ }
     }
     fn reset(&mut self, bg: Color) {
         if bg == Color::DEFAULT {
@@ -87,6 +89,7 @@ impl Row {
             self.occ = self.cells.len();
         }
         self.wrapped = false;
+        self.prompt = false;
     }
     #[inline]
     fn touch(&mut self, end: usize) {
@@ -317,6 +320,11 @@ pub struct Term {
     pub cwd: Option<String>,
     /// Text the application asked to put on the clipboard (OSC 52).
     pub clipboard_request: Option<String>,
+    /// Desktop notifications requested by the application (OSC 9 / 777):
+    /// (title, body), drained by the UI.
+    pub notifications: Vec<(String, String)>,
+    /// Absolute line of the prompt last jumped to (cleared on typing).
+    prompt_nav: Option<i64>,
     /// Synchronized output (mode 2026): when it began, if active.
     pub sync_since: Option<Instant>,
     /// Incremented on every visible change.
@@ -369,6 +377,8 @@ impl Term {
             link_ids: HashMap::new(),
             cwd: None,
             clipboard_request: None,
+            notifications: Vec::new(),
+            prompt_nav: None,
             sync_since: None,
             generation: 1,
             last_printed: ' ',
@@ -441,6 +451,7 @@ impl Term {
     }
 
     pub fn reset_view(&mut self) {
+        self.prompt_nav = None;
         if self.display_offset != 0 {
             self.display_offset = 0;
             self.dirty();
@@ -548,6 +559,62 @@ impl Term {
         let want_top = idx.saturating_sub(g.rows / 2).min(g.lines.len() - g.rows);
         self.display_offset = g.lines.len() - g.rows - want_top;
         self.dirty();
+    }
+
+    fn notify(&mut self, title: String, body: String) {
+        // Bounded, so a misbehaving program can't queue up unlimited popups.
+        if self.notifications.len() < 8 {
+            let clip = |s: String| s.chars().filter(|c| !c.is_control()).take(500).collect::<String>();
+            self.notifications.push((clip(title), clip(body)));
+        }
+    }
+
+    /// Scroll the view to the previous (`dir < 0`) or next shell prompt
+    /// (OSC 133 mark), putting it at the top of the screen. Returns the
+    /// prompt line's text, or None if there is no prompt in that direction
+    /// (moving forward past the last prompt returns to the bottom).
+    pub fn jump_to_prompt(&mut self, dir: isize) -> Option<String> {
+        if self.alt_active {
+            return None;
+        }
+        let g = &self.grid;
+        let base = g.lines.len() - g.rows;
+        // Continue from the last prompt jumped to; otherwise start at the
+        // cursor (when at the bottom) or the top of the scrolled-back view.
+        let start = self
+            .prompt_nav
+            .map(|l| l - g.dropped as i64)
+            .filter(|&i| i >= 0 && (i as usize) < g.lines.len())
+            .map(|i| i as usize)
+            .unwrap_or(if self.display_offset == 0 { base + self.cy } else { base - self.display_offset });
+        let found = if dir < 0 {
+            (0..start).rev().find(|&i| g.lines[i].prompt)
+        } else {
+            (start + 1..g.lines.len()).find(|&i| g.lines[i].prompt)
+        };
+        let Some(idx) = found else {
+            if dir > 0 && (self.display_offset > 0 || self.prompt_nav.is_some()) {
+                self.reset_view();
+                return Some(String::new());
+            }
+            return None;
+        };
+        let abs = g.dropped as i64 + idx as i64;
+        let text: String = g.lines[idx]
+            .cells
+            .iter()
+            .filter(|c| c.flags & flags::WIDE_SPACER == 0)
+            .map(|c| c.c)
+            .collect::<String>()
+            .trim()
+            .to_string();
+        self.prompt_nav = Some(abs);
+        let offset = base.saturating_sub(idx);
+        if offset != self.display_offset {
+            self.display_offset = offset;
+            self.dirty();
+        }
+        Some(text)
     }
 
     /// Case-insensitive unless the query has uppercase ("smart case").
@@ -844,17 +911,20 @@ impl Term {
                 self.clear_cells(self.cy, self.cx, cols);
                 for y in self.cy + 1..rows {
                     self.clear_cells(y, 0, cols);
+                    self.active().row_mut(y).prompt = false;
                 }
             }
             1 => {
                 for y in 0..self.cy {
                     self.clear_cells(y, 0, cols);
+                    self.active().row_mut(y).prompt = false;
                 }
                 self.clear_cells(self.cy, 0, self.cx + 1);
             }
             2 => {
                 for y in 0..rows {
                     self.clear_cells(y, 0, cols);
+                    self.active().row_mut(y).prompt = false;
                 }
             }
             3 => {
@@ -1492,6 +1562,31 @@ impl Perform for Term {
                     self.intern_link(uri)
                 };
             }
+            b"133" => {
+                // Semantic prompt marks; only "prompt starts here" (A) is used.
+                // The alternate screen has no history to jump through.
+                if params.get(1).is_some_and(|p| p.first() == Some(&b'A')) && !self.alt_active {
+                    let y = self.cy;
+                    self.grid.row_mut(y).prompt = true;
+                }
+            }
+            b"9" => {
+                // iTerm2-style notification: 9 ; body. "9;4;..." is ConEmu's
+                // progress report, not a notification.
+                let body = rest();
+                let progress = params.len() > 2 && params[1].iter().all(u8::is_ascii_digit);
+                if !body.is_empty() && !progress {
+                    self.notify(String::new(), String::from_utf8_lossy(&body).into_owned());
+                }
+            }
+            b"777" => {
+                // urxvt-style: 777 ; notify ; title ; body
+                if params.get(1) == Some(&&b"notify"[..]) && params.len() > 2 {
+                    let title = String::from_utf8_lossy(params[2]).into_owned();
+                    let body = if params.len() > 3 { params[3..].join(&b';') } else { Vec::new() };
+                    self.notify(title, String::from_utf8_lossy(&body).into_owned());
+                }
+            }
             b"52" => {
                 // 52 ; selection ; base64-data   ("?" = query, which we refuse)
                 if let Some(data) = params.get(2) {
@@ -1923,5 +2018,42 @@ mod tests {
         feed(&mut t, &mut p, "\x1b[?2026$p\x1b[?2026l\x1b[?2026$p\x1b[?9999$p");
         assert_eq!(t.responses, b"\x1b[?2026;1$y\x1b[?2026;2$y\x1b[?9999;0$y");
         assert!(t.sync_since.is_none());
+    }
+
+    #[test]
+    fn prompt_marks_and_jumping() {
+        let (mut t, mut p) = term(20, 3);
+        for n in 0..4 {
+            feed(&mut t, &mut p, &format!("\x1b]133;A\x07$ cmd{n}\r\nout{n}\r\n"));
+        }
+        feed(&mut t, &mut p, "\x1b]133;A\x07$ ");
+        // Back from the live prompt: cmd3, cmd2, ... then nothing.
+        assert_eq!(t.jump_to_prompt(-1).as_deref(), Some("$ cmd3"));
+        assert_eq!(line(&t, 0), "$ cmd3");
+        assert_eq!(t.jump_to_prompt(-1).as_deref(), Some("$ cmd2"));
+        assert_eq!(line(&t, 0), "$ cmd2");
+        assert_eq!(t.jump_to_prompt(-1).as_deref(), Some("$ cmd1"));
+        assert_eq!(t.jump_to_prompt(-1).as_deref(), Some("$ cmd0"));
+        assert_eq!(t.jump_to_prompt(-1), None);
+        assert_eq!(t.jump_to_prompt(1).as_deref(), Some("$ cmd1"));
+        // Typing returns to the bottom and restarts navigation.
+        t.reset_view();
+        assert_eq!(t.display_offset, 0);
+        assert_eq!(t.jump_to_prompt(1), None);
+        // Clearing the screen drops marks on cleared rows.
+        feed(&mut t, &mut p, "\x1b[H\x1b[2J\x1b[3J");
+        assert_eq!(t.jump_to_prompt(-1), None);
+    }
+
+    #[test]
+    fn notifications() {
+        let (mut t, mut p) = term(20, 3);
+        feed(&mut t, &mut p, "\x1b]9;build done\x07");
+        feed(&mut t, &mut p, "\x1b]9;4;1;50\x07"); // progress, not a notification
+        feed(&mut t, &mut p, "\x1b]777;notify;Make;ok; really\x1b\\");
+        assert_eq!(
+            t.notifications,
+            vec![(String::new(), "build done".into()), ("Make".into(), "ok; really".into())]
+        );
     }
 }

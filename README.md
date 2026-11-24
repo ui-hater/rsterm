@@ -15,7 +15,9 @@ A GPU-rendered terminal emulator for Linux, built around two goals: raw throughp
 - Built-in themes (Tomorrow Night, High Contrast Dark and Light, Solarized Dark and Light, Gruvbox Dark, Dracula, Nord), plus custom colors
 - OSC 8 hyperlinks, OSC 52 clipboard writes, colors that programs can change (OSC 4/10/11/12), synchronized output
 - Font fallback through fontconfig, with box-drawing and block characters drawn procedurally so they line up exactly
-- Dropdown (quake-style) mode with a global hotkey
+- Dropdown (quake-style) mode with a global hotkey and slide animation
+- Shell integration for zsh and bash (loaded automatically, no dotfile changes): jump between prompts in the scrollback, and each prompt you land on is read aloud
+- Desktop notifications from programs (OSC 9 and OSC 777). When you're looking at that tab they're spoken instead of shown as a popup
 - Config file that is reloaded automatically when it changes
 
 ## Building
@@ -50,6 +52,8 @@ rsterm --bench FILE       # headless parser benchmark, prints MB/s
 | Ctrl+Shift+A | Select all |
 | Ctrl+Shift+F | Search |
 | Ctrl+Shift+K | Clear scrollback |
+| Ctrl+Shift+PageUp / Ctrl+Shift+PageDown | Jump to previous / next shell prompt |
+| Shift+PageUp / Shift+PageDown, Shift+Home / Shift+End | Scroll the scrollback |
 | Ctrl+Shift+= / Ctrl+Shift+- / Ctrl+Shift+0 | Zoom in / zoom out / reset zoom |
 | Ctrl+, | Settings |
 | Ctrl+Shift+, | Reload config |
@@ -58,7 +62,7 @@ rsterm --bench FILE       # headless parser benchmark, prints MB/s
 
 ### Dropdown mode
 
-`rsterm --dropdown` starts one long-lived terminal that slides in from the top or bottom of the screen. Press the hotkey (F12 by default, set with `dropdown-hotkey`) to show or hide it. Under Wayland the hotkey grab doesn't work; bind `rsterm --dropdown` to a shortcut in your desktop settings instead. Set `dropdown-autostart = true` to start it hidden when you log in.
+`rsterm --dropdown` starts one long-lived terminal that slides in from the top or bottom of the screen (`dropdown-animation-duration`, in seconds, default 0.2; 0 turns the animation off). Press the hotkey (F12 by default, set with `dropdown-hotkey`) to show or hide it. Under Wayland the hotkey grab doesn't work; bind `rsterm --dropdown` to a shortcut in your desktop settings instead. Set `dropdown-autostart = true` to start it hidden when you log in.
 
 Closing the last shell in the dropdown starts a new one and hides the window. Use Quit to really exit.
 
@@ -83,7 +87,11 @@ dropdown-position = top
 dropdown-hotkey = F12
 ```
 
-All keys: `font-family`, `font-size`, `theme`, `foreground`, `background`, `cursor-color`, `selection-foreground`, `selection-background`, `scrollback-limit`, `cursor-style`, `cursor-style-blink`, `window-padding`, `window-width`, `window-height`, `window-decorations`, `tab-bar`, `copy-on-select`, `mouse-hide-while-typing`, `mouse-scroll-multiplier`, `visual-bell`, `bold-is-bright`, `window-inherit-working-directory`, `clipboard-write`, `command`, `dropdown-width`, `dropdown-height`, `dropdown-position`, `dropdown-hide-on-focus-loss`, `dropdown-always-on-top`, `dropdown-hotkey`, `dropdown-autostart`.
+All keys: `font-family`, `font-size`, `theme`, `foreground`, `background`, `cursor-color`, `selection-foreground`, `selection-background`, `scrollback-limit`, `cursor-style`, `cursor-style-blink`, `window-padding`, `window-width`, `window-height`, `window-decorations`, `tab-bar`, `copy-on-select`, `mouse-hide-while-typing`, `mouse-scroll-multiplier`, `visual-bell`, `bold-is-bright`, `window-inherit-working-directory`, `clipboard-write`, `command`, `dropdown-width`, `dropdown-height`, `dropdown-position`, `dropdown-hide-on-focus-loss`, `dropdown-always-on-top`, `dropdown-hotkey`, `dropdown-autostart`, `dropdown-animation-duration`, `desktop-notifications`, `shell-integration` (`detect` or `none`).
+
+### Shell integration
+
+With `shell-integration = detect` (the default), zsh and bash are started with a small hook that marks where each prompt begins (OSC 133). rsterm sets `ZDOTDIR` for zsh and `--rcfile` for bash. Your own `.zshenv`/`.zshrc` or `.bashrc` is still loaded, and nested shells behave normally. fish 4 and newer marks its prompts without any help. When `command` is set, the shell is started unchanged.
 
 Environment variables:
 

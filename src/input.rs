@@ -25,6 +25,8 @@ pub fn shortcut(ev: &KeyEvent, m: ModifiersState, tabs: usize) -> Option<Action>
             KeyCode::Digit0 => Action::ZoomReset,
             KeyCode::Comma => Action::ReloadConfig,
             KeyCode::Tab => Action::PrevTab,
+            KeyCode::PageUp => Action::PrevPrompt,
+            KeyCode::PageDown => Action::NextPrompt,
             _ => return None,
         };
         return Some(a);

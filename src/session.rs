@@ -36,6 +36,7 @@ pub struct Spawn<'a> {
     pub cell_h: u32,
     pub command: &'a str,
     pub cwd: Option<&'a str>,
+    pub shell_integration: bool,
     pub term: Term,
 }
 
@@ -56,6 +57,7 @@ impl Session {
             sp.cell_h as u16,
             sp.command,
             sp.cwd,
+            sp.shell_integration,
         )?;
         let shared = Arc::new(Shared { term: Mutex::new(sp.term), wakeup_pending: AtomicBool::new(false) });
 
