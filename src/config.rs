@@ -211,6 +211,18 @@ impl Config {
         (cfg, errors)
     }
 
+    /// On first start, write a config file listing every key with its
+    /// default value, so there is something to find and edit.
+    pub fn create_if_missing() {
+        let path = config_path();
+        if path.exists() {
+            return;
+        }
+        if let Err(e) = Config::default().save() {
+            eprintln!("rsterm: could not create {}: {e}", path.display());
+        }
+    }
+
     pub fn set(&mut self, key: &str, v: &str) -> Result<(), String> {
         let bad = || format!("invalid value {v:?} for {key}");
         match key {

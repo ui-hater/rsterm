@@ -1587,6 +1587,7 @@ struct App {
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) {
         use winit::platform::x11::{WindowAttributesExtX11, WindowType};
+        Config::create_if_missing();
         let (cfg, errors) = Config::load();
         let dropdown = self.dropdown;
         let mut attrs = Window::default_attributes()
