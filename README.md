@@ -33,6 +33,15 @@ cargo build --release
 
 The release profile uses fat LTO, so linking takes a few minutes.
 
+To install it with an application menu entry:
+
+```sh
+sudo install -Dm755 target/release/rsterm /usr/local/bin/rsterm
+sudo install -Dm644 rsterm.desktop /usr/local/share/applications/rsterm.desktop
+```
+
+Or just for your user: put the binary somewhere on your `$PATH` (e.g. `~/.local/bin`) and copy `rsterm.desktop` to `~/.local/share/applications/`. The desktop file runs `rsterm` from `$PATH`, so it works wherever you install the binary.
+
 ## Usage
 
 ```sh

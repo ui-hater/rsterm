@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=rsterm
+GenericName=Terminal
+Comment=Fast, screen reader accessible terminal emulator
+TryExec=rsterm
+Exec=rsterm
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;console;
+StartupWMClass=rsterm
+Actions=dropdown;
+
+[Desktop Action dropdown]
+Name=Toggle Dropdown Terminal
+Exec=rsterm --dropdown

@@ -138,6 +138,41 @@ fn autostart_path() -> PathBuf {
     base.join("autostart").join("rsterm-dropdown.desktop")
 }
 
+/// The program for the autostart entry's `Exec`/`TryExec`: plain `rsterm`
+/// when that is what `$PATH` finds (so the entry keeps working if the binary
+/// is reinstalled elsewhere, and doesn't bake in a home directory path),
+/// otherwise the absolute path of this binary, quoted per the Desktop Entry
+/// spec (`TryExec` takes the path unquoted).
+fn autostart_exe() -> std::io::Result<(String, String)> {
+    let exe = std::env::current_exe()?;
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let me = canon(&exe);
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join("rsterm"))
+            .find(|p| p.is_file())
+            .is_some_and(|p| me.is_some() && canon(&p) == me)
+    });
+    if on_path {
+        return Ok(("rsterm".into(), "rsterm".into()));
+    }
+    let s = exe.to_string_lossy();
+    let try_exec = s.replace('\\', "\\\\");
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {
+        return Ok((try_exec, s.into_owned()));
+    }
+    let mut q = String::from("\"");
+    for c in s.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            q.push('\\');
+        }
+        q.push(c);
+    }
+    q.push('"');
+    // The value is itself a string, whose own `\` escapes apply first.
+    Ok((try_exec, q.replace('\\', "\\\\")))
+}
+
 /// Create or remove the autostart entry to match `enabled`.
 pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
     let path = autostart_path();
@@ -147,14 +182,15 @@ pub fn set_autostart(enabled: bool) -> std::io::Result<()> {
             _ => Ok(()),
         };
     }
-    let exe = std::env::current_exe()?;
-    let exe = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let (try_exec, exe) = autostart_exe()?;
     let text = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=rsterm dropdown\n\
          Comment=Start the rsterm dropdown terminal hidden; show it with its hotkey\n\
-         Exec=\"{exe}\" --dropdown hide\n\
+         TryExec={try_exec}\n\
+         Exec={exe} --dropdown hide\n\
+         Icon=utilities-terminal\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n"
     );
