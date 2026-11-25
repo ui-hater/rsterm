@@ -1377,9 +1377,14 @@ impl State {
 
     // -- frame ----------------------------------------------------------------------
 
-    fn cursor_on(&self) -> bool {
-        !self.cfg.cursor_blink
-            || !self.focused
+    /// Whether the cursor blinks: the application's request (DECSCUSR /
+    /// mode 12) wins over `cursor-style-blink`.
+    fn cursor_blinks(&self, term: &Term) -> bool {
+        self.focused && term.cursor_blink.unwrap_or(self.cfg.cursor_blink)
+    }
+
+    fn cursor_on(&self, term: &Term) -> bool {
+        !self.cursor_blinks(term)
             || (self.blink_epoch.elapsed().as_millis() / BLINK.as_millis()) % 2 == 0
     }
 
@@ -1387,9 +1392,9 @@ impl State {
         let (cols, rows) = self.window_grid();
         let bar = self.bar_rows();
         let flash = self.flash_until.is_some_and(|t| Instant::now() < t);
-        let cursor_on = self.cursor_on();
         let shared = self.session().shared.clone();
         let term = shared.term.lock().unwrap();
+        let cursor_on = self.cursor_on(&term);
 
         // Hold the previous frame while the app has synchronized output on.
         if term.sync_since.is_some_and(|t| t.elapsed() < SYNC_TIMEOUT) {
@@ -1707,10 +1712,15 @@ impl State {
     /// Earliest time something needs to happen without input.
     fn next_deadline(&self) -> Option<Instant> {
         let mut d: Vec<Instant> = Vec::new();
-        if self.cfg.cursor_blink && self.focused {
+        let term = self.session().shared.term.lock().unwrap();
+        if self.cursor_blinks(&term) {
             let n = self.blink_epoch.elapsed().as_millis() / BLINK.as_millis() + 1;
             d.push(self.blink_epoch + BLINK * n as u32);
         }
+        if let Some(t) = term.sync_since {
+            d.push(t + SYNC_TIMEOUT);
+        }
+        drop(term);
         if let Some(t) = self.flash_until {
             d.push(t);
         }
@@ -1723,9 +1733,6 @@ impl State {
         if self.slide.is_some() {
             // ~120 Hz; the WM/compositor shows it at its own rate.
             d.push(Instant::now() + Duration::from_millis(8));
-        }
-        if let Some(t) = self.session().shared.term.lock().unwrap().sync_since {
-            d.push(t + SYNC_TIMEOUT);
         }
         d.into_iter().min()
     }

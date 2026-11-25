@@ -294,6 +294,9 @@ pub struct Term {
     pub cursor_visible: bool,
     /// Cursor shape requested by the application (DECSCUSR); None = user default.
     pub cursor_shape: Option<CursorShape>,
+    /// Cursor blinking requested by the application (DECSCUSR, or DEC mode 12);
+    /// None = user default (`cursor-style-blink`).
+    pub cursor_blink: Option<bool>,
     pub bracketed_paste: bool,
     pub mouse_mode: MouseMode,
     pub sgr_mouse: bool,
@@ -364,6 +367,7 @@ impl Term {
             linefeed_newline: false,
             cursor_visible: true,
             cursor_shape: None,
+            cursor_blink: None,
             bracketed_paste: false,
             mouse_mode: MouseMode::Off,
             sgr_mouse: false,
@@ -1091,7 +1095,7 @@ impl Term {
                 self.goto(0, 0);
             }
             7 => self.autowrap = on,
-            12 => {} // cursor blink
+            12 => self.cursor_blink = Some(on),
             25 => self.cursor_visible = on,
             47 => self.set_alt_screen(on, false, false),
             1047 => self.set_alt_screen(on, false, on),
@@ -1749,12 +1753,15 @@ impl Perform for Term {
                 self.pending_wrap = false;
             }
             ('q', [b' ']) => {
-                self.cursor_shape = match arg(params, 0, 0) {
+                let n = arg(params, 0, 0);
+                self.cursor_shape = match n {
                     0 => None,
                     1 | 2 => Some(CursorShape::Block),
                     3 | 4 => Some(CursorShape::Underline),
                     _ => Some(CursorShape::Bar),
-                }
+                };
+                // Odd values blink, even ones are steady, 0 is the user default.
+                self.cursor_blink = (n != 0).then_some(n % 2 == 1);
             }
             ('r', []) => {
                 let rows = self.rows();
@@ -1860,6 +1867,22 @@ mod tests {
 
     fn feed(t: &mut Term, p: &mut vte::Parser, s: &str) {
         p.advance(t, s.as_bytes());
+    }
+
+    #[test]
+    fn cursor_blink_requests() {
+        let (mut t, mut p) = term(10, 3);
+        assert_eq!(t.cursor_blink, None);
+        feed(&mut t, &mut p, "\x1b[5 q");
+        assert_eq!((t.cursor_shape, t.cursor_blink), (Some(CursorShape::Bar), Some(true)));
+        feed(&mut t, &mut p, "\x1b[2 q");
+        assert_eq!((t.cursor_shape, t.cursor_blink), (Some(CursorShape::Block), Some(false)));
+        feed(&mut t, &mut p, "\x1b[?12h");
+        assert_eq!(t.cursor_blink, Some(true));
+        feed(&mut t, &mut p, "\x1b[0 q");
+        assert_eq!((t.cursor_shape, t.cursor_blink), (None, None));
+        feed(&mut t, &mut p, "\x1b[?12l\x1bc");
+        assert_eq!(t.cursor_blink, None);
     }
 
     fn line(t: &Term, y: usize) -> String {
