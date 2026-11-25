@@ -1521,10 +1521,14 @@ impl State {
             announcement: &self.announcement,
             dropdown: self.dropdown,
         };
+        let scroll = self.a11y.scroll(&term, &g, &view);
         let update = self.a11y.update(&term, &g, &view);
         self.a11y_sent = (term.generation, self.ui_gen, self.session().id);
         self.a11y_last = Instant::now();
         drop(term);
+        if let Some(scroll) = scroll {
+            self.adapter.update_if_active(|| scroll);
+        }
         self.adapter.update_if_active(|| update);
     }
 

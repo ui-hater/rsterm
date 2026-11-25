@@ -83,7 +83,15 @@ pub struct UiView<'a> {
 #[derive(Default)]
 pub struct A11y {
     prev_lines: Vec<String>,
+    /// The TextRun node last sent for each line (re-sent shifted on scroll).
+    prev_nodes: Vec<Node>,
+    /// Lines `..valid` of `prev_lines` are in the tree; the rest must be sent.
+    valid: usize,
     prev_tab: Option<u64>,
+    /// (alt screen, absolute line of the top row) at the last update.
+    prev_top: Option<(bool, i64)>,
+    prev_caret: Option<(usize, usize)>,
+    prev_focus: Option<NodeId>,
     sent_tree: bool,
 }
 
@@ -131,6 +139,16 @@ fn extract_line(term: &Term, y: usize, cursor_col: Option<usize>, last: bool, cw
     l
 }
 
+/// The Terminal node (without children or selection) showing `rows` lines.
+fn terminal_node(term: &Term, g: &Geometry, title: &str, rows: usize) -> Node {
+    let mut tn = Node::new(Role::Terminal);
+    tn.set_label(title.to_string());
+    tn.set_bounds(g.cells((0, g.bar_rows, term.cols(), rows)));
+    tn.add_action(Action::Focus);
+    tn.add_action(Action::ShowContextMenu);
+    tn
+}
+
 /// Give a single-line text field its text: AT-SPI's Text interface (what
 /// screen readers read and track the caret in) comes from a TextRun child.
 fn text_field(field: &mut Node, run_id: NodeId, text: &str, bounds: Rect, cell_w: f64) -> (NodeId, Node) {
@@ -166,9 +184,49 @@ fn word_starts(text: &str) -> Option<Vec<u8>> {
 impl A11y {
     /// Forget what was sent so the next update is a full tree.
     pub fn reset(&mut self) {
-        self.prev_lines.clear();
-        self.prev_tab = None;
-        self.sent_tree = false;
+        *self = Self::default();
+    }
+
+    /// When the screen scrolled up by k lines since the last update, an
+    /// update that only drops the top k lines. Sent before `update`, it turns
+    /// a scroll into "k lines removed at the start" plus "new lines appended
+    /// at the end". In one update AccessKit's prefix/suffix text diff sees
+    /// every line change and reports the whole screen as removed and
+    /// re-inserted, so Orca re-reads the entire screen on every scroll and
+    /// falls further and further behind the output.
+    pub fn scroll(&mut self, term: &Term, g: &Geometry, ui: &UiView<'_>) -> Option<TreeUpdate> {
+        let top = (term.alt_active, term.abs_line(0));
+        let prev = self.prev_top?;
+        let rows = term.rows();
+        let tid = ui.tab_id;
+        if !self.sent_tree || self.prev_tab != Some(tid) || self.prev_lines.len() != rows || prev.0 != top.0 {
+            return None;
+        }
+        let k = usize::try_from(top.1 - prev.1).ok().filter(|&k| k > 0 && k < self.valid)?;
+        let focus = self.prev_focus?;
+        self.prev_top = Some(top);
+        let keep = self.valid - k;
+        self.prev_lines.drain(..k);
+        self.prev_nodes.drain(..k);
+        self.prev_lines.resize(rows, String::new());
+        self.prev_nodes.resize(rows, Node::new(Role::TextRun));
+        self.valid = keep;
+
+        let mut nodes = Vec::with_capacity(keep + 1);
+        for (y, n) in self.prev_nodes[..keep].iter_mut().enumerate() {
+            n.set_bounds(g.cells((0, g.bar_rows + y, term.cols(), 1)));
+            nodes.push((line_node(tid, y), n.clone()));
+        }
+        let mut tn = terminal_node(term, g, ui.title, keep);
+        tn.set_children((0..keep).map(|y| line_node(tid, y)).collect::<Vec<_>>());
+        let caret = match self.prev_caret {
+            Some((y, idx)) if y >= k && y - k < keep => (y - k, idx),
+            _ => (0, 0),
+        };
+        let p = TextPosition { node: line_node(tid, caret.0), character_index: caret.1 };
+        tn.set_text_selection(TextSelection { anchor: p, focus: p });
+        nodes.push((term_node(tid), tn));
+        Some(TreeUpdate { nodes, tree: None, tree_id: TreeId::ROOT, focus })
     }
 
     pub fn update(&mut self, term: &Term, g: &Geometry, ui: &UiView<'_>) -> TreeUpdate {
@@ -181,6 +239,8 @@ impl A11y {
         let full_term = self.prev_tab != Some(tid) || self.prev_lines.len() != rows;
         if full_term {
             self.prev_lines = vec![String::new(); rows];
+            self.prev_nodes = vec![Node::new(Role::TextRun); rows];
+            self.valid = 0;
             self.prev_tab = Some(tid);
         }
         let cursor_y = term.cy + term.display_offset;
@@ -194,7 +254,7 @@ impl A11y {
                 let max = line.text.chars().count() - line.text.ends_with('\n') as usize;
                 caret = Some((y, idx.min(max)));
             }
-            if !full_term && self.prev_lines[y] == line.text {
+            if y < self.valid && self.prev_lines[y] == line.text {
                 continue;
             }
             let mut n = Node::new(Role::TextRun);
@@ -208,15 +268,15 @@ impl A11y {
             n.set_character_widths(line.widths);
             n.set_value(line.text.clone());
             self.prev_lines[y] = line.text;
+            self.prev_nodes[y] = n.clone();
             nodes.push((line_node(tid, y), n));
         }
+        self.valid = rows;
+        self.prev_top = Some((term.alt_active, term.abs_line(0)));
+        self.prev_caret = caret;
 
-        let mut tn = Node::new(Role::Terminal);
-        tn.set_label(ui.title.to_string());
-        tn.set_bounds(g.cells((0, g.bar_rows, term.cols(), rows)));
+        let mut tn = terminal_node(term, g, ui.title, rows);
         tn.set_children((0..rows).map(|y| line_node(tid, y)).collect::<Vec<_>>());
-        tn.add_action(Action::Focus);
-        tn.add_action(Action::ShowContextMenu);
         if let Some(sel) = self.term_selection(term, tid, caret) {
             tn.set_text_selection(sel);
         }
@@ -400,6 +460,7 @@ impl A11y {
             t
         });
         self.sent_tree = true;
+        self.prev_focus = Some(focus);
         TreeUpdate { nodes, tree, tree_id: TreeId::ROOT, focus }
     }
 }
@@ -429,5 +490,68 @@ impl A11y {
         let (y, idx) = caret?;
         let p = TextPosition { node: line_node(tid, y), character_index: idx };
         Some(TextSelection { anchor: p, focus: p })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The Terminal's document text as AccessKit would see it after `ups`.
+    fn apply(tree: &mut HashMap<NodeId, Node>, ups: &[TreeUpdate], tid: u64) -> String {
+        for u in ups {
+            for (id, n) in &u.nodes {
+                tree.insert(*id, n.clone());
+            }
+        }
+        tree[&term_node(tid)].children().iter().map(|id| tree[id].value().unwrap_or("").to_string()).collect()
+    }
+
+    /// AccessKit's change events: (removed, inserted) by common prefix/suffix.
+    fn diff(old: &str, new: &str) -> (String, String) {
+        let o: Vec<char> = old.chars().collect();
+        let n: Vec<char> = new.chars().collect();
+        let p = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+        let s = o[p..].iter().rev().zip(n[p..].iter().rev()).take_while(|(a, b)| a == b).count();
+        (o[p..o.len() - s].iter().collect(), n[p..n.len() - s].iter().collect())
+    }
+
+    #[test]
+    fn scrolling_only_inserts_new_lines() {
+        let mut t = Term::new(20, 4);
+        let mut p = vte::Parser::new();
+        let g = Geometry { cell_w: 8.0, cell_h: 16.0, pad: 0.0, bar_rows: 0, cols: 20, rows: 4 };
+        let cfg = Config::default();
+        let ui = UiView {
+            title: "t",
+            tab_id: 0,
+            tabs: &[],
+            overlay: &Overlay::None,
+            cfg: &cfg,
+            announcement: "",
+            dropdown: true,
+        };
+        let mut a = A11y::default();
+        let mut tree = HashMap::new();
+        p.advance(&mut t, b"one\r\ntwo\r\nthree\r\nfour");
+        let first = a.update(&t, &g, &ui);
+        let mut doc = apply(&mut tree, &[first], 0);
+        for (input, spoken) in [("\r\nfive", "\nfive"), ("\r\nsix\r\nseven", "\nsix\nseven")] {
+            p.advance(&mut t, input.as_bytes());
+            let mut ups = Vec::new();
+            if let Some(s) = a.scroll(&t, &g, &ui) {
+                let mid = apply(&mut tree, &[s.clone()], 0);
+                // Step 1 only removes text at the start.
+                assert!(doc.ends_with(&mid), "{doc:?} -> {mid:?}");
+                ups.push(s);
+            }
+            let mid = apply(&mut tree, &ups, 0);
+            let up = a.update(&t, &g, &ui);
+            let new = apply(&mut tree, &[up], 0);
+            assert_eq!(diff(&mid, &new).1, spoken);
+            doc = new;
+        }
+        assert_eq!(doc, "four\nfive\nsix\nseven");
     }
 }
