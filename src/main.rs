@@ -223,6 +223,10 @@ struct State {
     clipboard: Option<arboard::Clipboard>,
 
     blink_epoch: Instant,
+    /// Cursor blink phase in the last drawn frame. `next_deadline` only knows
+    /// when the *next* phase starts, so `about_to_wait` compares against this
+    /// to tell that a phase change still has to be drawn.
+    cursor_drawn: bool,
     flash_until: Option<Instant>,
 
     announcement: String,
@@ -1395,6 +1399,7 @@ impl State {
         let shared = self.session().shared.clone();
         let term = shared.term.lock().unwrap();
         let cursor_on = self.cursor_on(&term);
+        self.cursor_drawn = cursor_on;
 
         // Hold the previous frame while the app has synchronized output on.
         if term.sync_since.is_some_and(|t| t.elapsed() < SYNC_TIMEOUT) {
@@ -1910,6 +1915,7 @@ impl App {
             scroll_accum: 0.0,
             clipboard: None,
             blink_epoch: Instant::now(),
+            cursor_drawn: true,
             flash_until: None,
             announcement: String::new(),
             announce_flip: false,
@@ -2067,7 +2073,11 @@ impl ApplicationHandler<UserEvent> for App {
             st.dropdown_tick(now);
         }
         let mut wait = st.next_deadline();
-        if wait.is_some_and(|t| t <= now) {
+        let blink_due = {
+            let term = st.session().shared.term.lock().unwrap();
+            st.cursor_on(&term) != st.cursor_drawn
+        };
+        if blink_due || wait.is_some_and(|t| t <= now) {
             if st.flash_until.is_some_and(|t| t <= now) {
                 st.flash_until = None;
             }
