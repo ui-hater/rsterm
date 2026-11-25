@@ -90,6 +90,29 @@ pub struct MenuState {
     pub shortcuts: Vec<String>,
     /// Requested top-left cell (window grid coordinates).
     pub at: (usize, usize),
+    /// First MENU index shown when the window is too short for all items.
+    pub scroll: usize,
+}
+
+impl MenuState {
+    /// Keep the selection inside the `vis` visible rows.
+    pub fn follow(&mut self, vis: usize) {
+        let vis = vis.max(1);
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+            // Show the separator above the first item of a group too.
+            if self.scroll > 0 && MENU[self.scroll - 1].action.is_none() && vis > 1 {
+                self.scroll -= 1;
+            }
+        } else if self.sel >= self.scroll + vis {
+            self.scroll = self.sel + 1 - vis;
+            // Don't waste the top row on a separator.
+            if MENU[self.scroll].action.is_none() && self.scroll < self.sel {
+                self.scroll += 1;
+            }
+        }
+        self.scroll = self.scroll.min(MENU.len().saturating_sub(vis));
+    }
 }
 
 pub struct SearchState {
@@ -300,9 +323,29 @@ pub fn settings_rect(cols: usize, rows: usize) -> CellRect {
     ((cols - w) / 2, (rows - h) / 2, w, h)
 }
 
-/// Rows available for setting items inside the panel.
-pub fn settings_visible(h: usize) -> usize {
-    h.saturating_sub(6).max(1)
+/// Rows of menu items visible inside a menu panel of height `h`.
+pub fn menu_visible(h: usize) -> usize {
+    h.saturating_sub(2).max(1)
+}
+
+/// Vertical layout of the settings panel, as row offsets from its top.
+/// Short windows drop the spacing, then the config path, then the help line,
+/// so the setting rows keep as much room as possible.
+pub struct SettingsLayout {
+    pub top: usize,
+    pub vis: usize,
+    pub help: Option<usize>,
+    pub saved: Option<usize>,
+}
+
+pub fn settings_layout(h: usize) -> SettingsLayout {
+    if h >= 14 {
+        SettingsLayout { top: 2, vis: h - 6, help: Some(h - 3), saved: Some(h - 2) }
+    } else if h >= 7 {
+        SettingsLayout { top: 1, vis: h - 3, help: Some(h - 2), saved: None }
+    } else {
+        SettingsLayout { top: 1, vis: h.saturating_sub(2).max(1), help: None, saved: None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +444,15 @@ impl Painter<'_> {
         self.text(lay.plus_x, y, " + ", 3, c.fg, c.panel, STYLE_BOLD);
     }
 
-    pub fn menu(&mut self, m: &MenuState, c: &UiColors) {
+    pub fn menu(&mut self, m: &mut MenuState, c: &UiColors) {
         let (x, y, w, h) = menu_rect(m, self.cols, self.rows);
         self.frame((x, y, w, h), c.dim, c.panel);
-        for (i, it) in MENU.iter().enumerate().take(h.saturating_sub(2)) {
-            let yy = y + 1 + i;
+        let vis = menu_visible(h);
+        m.follow(vis);
+        self.scroll_marks(x + w - 2, y, y + h - 1, m.scroll > 0, m.scroll + vis < MENU.len(), c);
+        for (row, i) in (m.scroll..MENU.len()).take(vis).enumerate() {
+            let it = &MENU[i];
+            let yy = y + 1 + row;
             if it.action.is_none() {
                 for xx in x + 1..x + w - 1 {
                     self.put(xx, yy, '─', c.dim, c.panel, 0);
@@ -425,16 +472,19 @@ impl Painter<'_> {
         let (x, y, w, h) = settings_rect(self.cols, self.rows);
         self.frame((x, y, w, h), c.dim, c.panel);
         self.text(x + 2, y, " Settings ", w - 4, c.fg, c.panel, STYLE_BOLD);
-        let vis = settings_visible(h);
+        let lay = settings_layout(h);
+        let vis = lay.vis;
         if s.sel < s.scroll {
             s.scroll = s.sel;
         } else if s.sel >= s.scroll + vis {
             s.scroll = s.sel + 1 - vis;
         }
+        s.scroll = s.scroll.min(s.items.len().saturating_sub(vis));
+        self.scroll_marks(x + w - 3, y, y + h - 1, s.scroll > 0, s.scroll + vis < s.items.len(), c);
         let label_w = (w.saturating_sub(4) / 2).min(36);
         for (row, i) in (s.scroll..s.items.len()).take(vis).enumerate() {
             let it = &s.items[i];
-            let yy = y + 2 + row;
+            let yy = y + lay.top + row;
             let sel = i == s.sel;
             let (fg, bg) = if sel { (c.accent_fg, c.accent_bg) } else { (c.fg, c.panel) };
             self.fill((x + 1, yy, w - 2, 1), bg);
@@ -456,10 +506,23 @@ impl Painter<'_> {
         } else {
             "↑↓ choose  ←→ change  Enter edit/toggle  Esc close"
         };
-        self.text(x + 2, y + h - 3, help, w - 4, c.dim, c.panel, 0);
-        let path = config::config_path();
-        let saved = format!("Saved to {}", path.display());
-        self.text(x + 2, y + h - 2, &saved, w - 4, c.dim, c.panel, 0);
+        if let Some(r) = lay.help {
+            self.text(x + 2, y + r, help, w - 4, c.dim, c.panel, 0);
+        }
+        if let Some(r) = lay.saved {
+            let saved = format!("Saved to {}", config::config_path().display());
+            self.text(x + 2, y + r, &saved, w - 4, c.dim, c.panel, 0);
+        }
+    }
+
+    /// Arrows on a panel's top/bottom border showing there is more to scroll to.
+    fn scroll_marks(&mut self, x: usize, top: usize, bottom: usize, up: bool, down: bool, c: &UiColors) {
+        if up {
+            self.put(x, top, '▲', c.fg, c.panel, 0);
+        }
+        if down {
+            self.put(x, bottom, '▼', c.fg, c.panel, 0);
+        }
     }
 
     pub fn search_bar(&mut self, y: usize, s: &SearchState, c: &UiColors) {

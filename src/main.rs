@@ -619,7 +619,7 @@ impl State {
                     Some(self.mouse_cell_or_cursor())
                 };
                 self.overlay = match at {
-                    Some(at) => Overlay::Menu(ui::MenuState { sel: 0, at, shortcuts: self.menu_shortcuts() }),
+                    Some(at) => Overlay::Menu(ui::MenuState { sel: 0, at, shortcuts: self.menu_shortcuts(), scroll: 0 }),
                     None => Overlay::None,
                 };
                 self.touch_ui();
@@ -1083,7 +1083,7 @@ impl State {
                 }
                 let (x, y, w, h) = ui::menu_rect(m, cols, rows);
                 let inside = cell.0 >= x && cell.0 < x + w && cell.1 > y && cell.1 < y + h - 1;
-                let action = inside.then(|| ui::MENU.get(cell.1 - y - 1).and_then(|i| i.action)).flatten();
+                let action = inside.then(|| ui::MENU.get(m.scroll + cell.1 - y - 1).and_then(|i| i.action)).flatten();
                 self.overlay = Overlay::None;
                 self.touch_ui();
                 if let Some(a) = action {
@@ -1098,8 +1098,10 @@ impl State {
                 let (x, y, w, h) = ui::settings_rect(cols, rows);
                 if cell.0 < x || cell.0 >= x + w || cell.1 < y || cell.1 >= y + h {
                     self.overlay = Overlay::None;
-                } else if cell.1 >= y + 2 && cell.1 < y + 2 + ui::settings_visible(h) {
-                    let i = s.scroll + cell.1 - y - 2;
+                } else if let Some(row) = cell.1.checked_sub(y + ui::settings_layout(h).top)
+                    .filter(|&r| r < ui::settings_layout(h).vis)
+                {
+                    let i = s.scroll + row;
                     if i < s.items.len() {
                         let was = s.sel;
                         s.sel = i;
@@ -1203,7 +1205,7 @@ impl State {
             }
             (MouseButton::Middle, true) => self.paste(true),
             (MouseButton::Right, true) => {
-                self.overlay = Overlay::Menu(ui::MenuState { sel: 0, at: cell, shortcuts: self.menu_shortcuts() });
+                self.overlay = Overlay::Menu(ui::MenuState { sel: 0, at: cell, shortcuts: self.menu_shortcuts(), scroll: 0 });
                 self.touch_ui();
             }
             _ => {}
@@ -1216,7 +1218,7 @@ impl State {
         if let Overlay::Menu(m) = &mut self.overlay {
             let (x, y, w, h) = ui::menu_rect(m, cols, rows);
             if cell.0 > x && cell.0 < x + w - 1 && cell.1 > y && cell.1 < y + h - 1 {
-                let i = cell.1 - y - 1;
+                let i = m.scroll + cell.1 - y - 1;
                 if ui::MENU.get(i).is_some_and(|it| it.action.is_some()) && m.sel != i {
                     m.sel = i;
                     self.touch_ui();
@@ -1269,6 +1271,14 @@ impl State {
 
     fn on_scroll(&mut self, lines: isize) {
         if lines == 0 {
+            return;
+        }
+        if let Overlay::Menu(m) = &mut self.overlay {
+            let dir = if lines > 0 { -1 } else { 1 };
+            for _ in 0..lines.unsigned_abs() {
+                m.sel = ui::menu_step(m.sel, dir);
+            }
+            self.touch_ui();
             return;
         }
         if let Overlay::Settings(s) = &mut self.overlay {

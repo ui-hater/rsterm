@@ -336,7 +336,10 @@ impl A11y {
                     n.set_position_in_set(pos + 1);
                     n.set_size_of_set(real.len());
                     n.add_action(Action::Click);
-                    n.set_bounds(g.cells((rect.0 + 1, rect.1 + 1 + i, rect.2 - 2, 1)));
+                    let row = i as isize - m.scroll as isize;
+                    if row >= 0 && (row as usize) < ui::menu_visible(rect.3) {
+                        n.set_bounds(g.cells((rect.0 + 1, rect.1 + 1 + row as usize, rect.2 - 2, 1)));
+                    }
                     nodes.push((id, n));
                 }
                 menu.set_children(kids);
@@ -354,12 +357,13 @@ impl A11y {
                 );
                 d.set_bounds(g.cells(rect));
                 let mut kids = Vec::new();
-                let vis = ui::settings_visible(rect.3);
+                let lay = ui::settings_layout(rect.3);
+                let vis = lay.vis;
                 for (i, it) in s.items.iter().enumerate() {
                     let id = NodeId(SETTING_BASE + i as u64);
                     let row = i as isize - s.scroll as isize;
                     let row_rect = (row >= 0 && (row as usize) < vis)
-                        .then(|| g.cells((rect.0 + 1, rect.1 + 2 + row as usize, rect.2 - 2, 1)));
+                        .then(|| g.cells((rect.0 + 1, rect.1 + lay.top + row as usize, rect.2 - 2, 1)));
                     kids.push(id);
                     let value = ui.cfg.get(it.key);
                     let mut n = match &it.kind {
