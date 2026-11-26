@@ -138,12 +138,11 @@ fn autostart_path() -> PathBuf {
     base.join("autostart").join("rsterm-dropdown.desktop")
 }
 
-/// The program for the autostart entry's `Exec`/`TryExec`: plain `rsterm`
-/// when that is what `$PATH` finds (so the entry keeps working if the binary
-/// is reinstalled elsewhere, and doesn't bake in a home directory path),
-/// otherwise the absolute path of this binary, quoted per the Desktop Entry
-/// spec (`TryExec` takes the path unquoted).
-fn autostart_exe() -> std::io::Result<(String, String)> {
+/// How a launcher should run this binary: `None` when plain `rsterm` on
+/// `$PATH` is this binary (so entries keep working if it is reinstalled
+/// elsewhere and don't bake in a home directory path), otherwise its
+/// absolute path.
+pub fn launch_exe() -> std::io::Result<Option<PathBuf>> {
     let exe = std::env::current_exe()?;
     let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
     let me = canon(&exe);
@@ -153,9 +152,16 @@ fn autostart_exe() -> std::io::Result<(String, String)> {
             .find(|p| p.is_file())
             .is_some_and(|p| me.is_some() && canon(&p) == me)
     });
-    if on_path {
+    Ok(if on_path { None } else { Some(exe) })
+}
+
+/// The program for the autostart entry's `Exec`/`TryExec` (see
+/// `launch_exe`), quoted per the Desktop Entry spec (`TryExec` takes the
+/// path unquoted).
+fn autostart_exe() -> std::io::Result<(String, String)> {
+    let Some(exe) = launch_exe()? else {
         return Ok(("rsterm".into(), "rsterm".into()));
-    }
+    };
     let s = exe.to_string_lossy();
     let try_exec = s.replace('\\', "\\\\");
     if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)) {

@@ -5,6 +5,7 @@ mod config;
 mod dropdown;
 mod hotkey;
 mod font;
+mod gnome;
 mod input;
 mod keybind;
 mod pty;
@@ -245,6 +246,8 @@ struct State {
     hide_at: Option<Instant>,
     /// Sends a changed `dropdown-hotkey` to the hotkey thread.
     hotkey_tx: Option<std::sync::mpsc::Sender<String>>,
+    /// The hotkey is a GNOME keybinding (`gnome.rs`) instead of an X grab.
+    gnome_hotkey: bool,
     /// How far the dropdown is slid in: 0 = off screen, 1 = in place.
     slide_pos: f32,
     /// Key bindings built from the defaults and `keybind` entries.
@@ -482,6 +485,8 @@ impl State {
             if c.dropdown_hotkey != old.dropdown_hotkey {
                 if let Some(tx) = &self.hotkey_tx {
                     let _ = tx.send(c.dropdown_hotkey.clone());
+                } else if self.gnome_hotkey {
+                    self.sync_gnome_hotkey();
                 }
             }
         } else if old.decorations != self.cfg.decorations {
@@ -1611,6 +1616,18 @@ impl State {
         self.window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
     }
 
+    /// Register `dropdown-hotkey` as a GNOME keybinding, off the main thread
+    /// (it runs gsettings).
+    fn sync_gnome_hotkey(&self) {
+        let spec = self.cfg.dropdown_hotkey.clone();
+        let p = self.proxy.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = gnome::sync_hotkey(&spec) {
+                let _ = p.send_event(UserEvent::Notice(format!("global hotkey unavailable: {e}")));
+            }
+        });
+    }
+
     /// Shown, and not on its way out.
     fn dropdown_visible(&self) -> bool {
         self.shown && !self.slide.is_some_and(|s| s.to == 0.0)
@@ -1940,6 +1957,7 @@ impl App {
             focus_until: None,
             hide_at: None,
             hotkey_tx: None,
+            gnome_hotkey: false,
             binds,
             consumed_keys: Vec::new(),
             slide_pos: 1.0,
@@ -1952,7 +1970,12 @@ impl App {
             eprintln!("rsterm: could not update autostart entry: {e}");
         }
         if dropdown {
-            if std::env::var_os("DISPLAY").is_some() {
+            if gnome::wayland_session() {
+                // The X grab would only work while an XWayland window has
+                // focus; GNOME runs `rsterm --dropdown` for us instead.
+                st.gnome_hotkey = true;
+                st.sync_gnome_hotkey();
+            } else if std::env::var_os("DISPLAY").is_some() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let p = self.proxy.clone();
                 hotkey::spawn(st.cfg.dropdown_hotkey.clone(), rx, move |m| {

@@ -3,8 +3,8 @@
 //! Runs on its own thread with its own X connection, so it works no matter
 //! which window has focus. Only X11 (or apps under XWayland) can grab keys
 //! this way; on a Wayland session the key only fires while an XWayland
-//! window is focused, so binding `rsterm --dropdown` in the desktop remains
-//! the fallback there.
+//! window is focused, so on GNOME `gnome.rs` registers a desktop keybinding
+//! instead, and elsewhere binding `rsterm --dropdown` remains the fallback.
 
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -16,6 +16,61 @@ use x11rb::protocol::xproto::{ConnectionExt, GrabMode, ModMask, Window};
 pub struct Hotkey {
     mods: u16,
     keysym: u32,
+}
+
+/// Named keys: accepted spellings (lowercase), keysym, and the X keysym
+/// name GTK/GNOME accelerators use.
+const NAMED: &[(&[&str], u32, &str)] = &[
+    (&["grave", "`"], 0x60, "grave"),
+    (&["escape", "esc"], 0xff1b, "Escape"),
+    (&["tab"], 0xff09, "Tab"),
+    (&["return", "enter"], 0xff0d, "Return"),
+    (&["space"], 0x20, "space"),
+    (&["pause"], 0xff13, "Pause"),
+    (&["scroll_lock", "scrolllock"], 0xff14, "Scroll_Lock"),
+    (&["print"], 0xff61, "Print"),
+    (&["insert"], 0xff63, "Insert"),
+    (&["home"], 0xff50, "Home"),
+    (&["end"], 0xff57, "End"),
+    (&["page_up", "pageup", "prior"], 0xff55, "Page_Up"),
+    (&["page_down", "pagedown", "next"], 0xff56, "Page_Down"),
+    (&["menu"], 0xff67, "Menu"),
+    (&["minus", "-"], 0x2d, "minus"),
+    (&["equal", "="], 0x3d, "equal"),
+    (&["comma", ","], 0x2c, "comma"),
+    (&["period", "."], 0x2e, "period"),
+    (&["slash", "/"], 0x2f, "slash"),
+    (&["backslash", "\\"], 0x5c, "backslash"),
+    (&["semicolon", ";"], 0x3b, "semicolon"),
+    (&["apostrophe", "'"], 0x27, "apostrophe"),
+    (&["bracketleft", "["], 0x5b, "bracketleft"),
+    (&["bracketright", "]"], 0x5d, "bracketright"),
+];
+
+impl Hotkey {
+    /// GTK accelerator syntax, as GNOME keybinding settings take it,
+    /// e.g. `<Control><Shift>F12`.
+    pub fn gtk_accel(self) -> String {
+        let mut s = String::new();
+        for (m, name) in [
+            (ModMask::CONTROL, "<Control>"),
+            (ModMask::SHIFT, "<Shift>"),
+            (ModMask::M1, "<Alt>"),
+            (ModMask::M4, "<Super>"),
+        ] {
+            if self.mods & u16::from(m) != 0 {
+                s.push_str(name);
+            }
+        }
+        match self.keysym {
+            k @ 0xffbe..=0xffe0 => s.push_str(&format!("F{}", k - 0xffbe + 1)),
+            k => match NAMED.iter().find(|n| n.1 == k) {
+                Some(n) => s.push_str(n.2),
+                None => s.push(char::from_u32(k).unwrap_or('?')),
+            },
+        }
+        s
+    }
 }
 
 /// Parse e.g. `F12`, `ctrl+grave`, `super+Return`. Case-insensitive.
@@ -41,31 +96,7 @@ pub fn parse(spec: &str) -> Option<Hotkey> {
             }
             0xffbe + n - 1
         }
-        "grave" | "`" => 0x60,
-        "escape" | "esc" => 0xff1b,
-        "tab" => 0xff09,
-        "return" | "enter" => 0xff0d,
-        "space" => 0x20,
-        "pause" => 0xff13,
-        "scroll_lock" | "scrolllock" => 0xff14,
-        "print" => 0xff61,
-        "insert" => 0xff63,
-        "home" => 0xff50,
-        "end" => 0xff57,
-        "page_up" | "pageup" | "prior" => 0xff55,
-        "page_down" | "pagedown" | "next" => 0xff56,
-        "menu" => 0xff67,
-        "minus" | "-" => 0x2d,
-        "equal" | "=" => 0x3d,
-        "comma" | "," => 0x2c,
-        "period" | "." => 0x2e,
-        "slash" | "/" => 0x2f,
-        "backslash" | "\\" => 0x5c,
-        "semicolon" | ";" => 0x3b,
-        "apostrophe" | "'" => 0x27,
-        "bracketleft" | "[" => 0x5b,
-        "bracketright" | "]" => 0x5d,
-        _ => return None,
+        k => NAMED.iter().find(|(names, _, _)| names.contains(&k))?.1,
     };
     Some(Hotkey { mods, keysym })
 }
@@ -184,5 +215,9 @@ mod tests {
         assert!(parse("hyper+x").is_none());
         assert!(parse("F99").is_none());
         assert!(parse("").is_none());
+        assert_eq!(parse("F12").unwrap().gtk_accel(), "F12");
+        assert_eq!(parse("ctrl+shift+grave").unwrap().gtk_accel(), "<Control><Shift>grave");
+        assert_eq!(parse("super+Page_Up").unwrap().gtk_accel(), "<Super>Page_Up");
+        assert_eq!(parse("alt+x").unwrap().gtk_accel(), "<Alt>x");
     }
 }
