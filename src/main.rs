@@ -1915,7 +1915,9 @@ impl App {
             cells: Vec::new(),
             last_frame: 0,
             modifiers: ModifiersState::empty(),
-            focused: true,
+            // A dropdown starts unmapped, so unfocused; assuming focus would make
+            // the focus retry stop at once and the first toggle hide instead of show.
+            focused: !dropdown,
             mouse_px: (-1.0, -1.0),
             mouse_buttons: 0,
             selecting: false,
